@@ -20,6 +20,9 @@ namespace star
 class PolicyLRU : public MigrationManager {
     public:
         struct LRUMeta {
+                // SAFETY: raw local-heap VA, valid ONLY on the owning coordinator. This field is
+                // embedded inside TwoPLPashaSharedDataSCC::migration_policy_meta which is CXL-allocated.
+                // Only the partition-owning node may dereference this pointer. See: CXL VA hazard id=4.
                 MigrationManager::migrated_row_entity *row_entity_ptr{ nullptr };       // this will be in local DRAM and is only accessed by the owner host
 
                 boost::interprocess::offset_ptr<LRUMeta> prev{ nullptr };
@@ -110,13 +113,13 @@ class PolicyLRU : public MigrationManager {
                 // head is the victim
                 LRUMeta *get_next_victim()
                 {
-                        if (cur_victim == nullptr) {
+                        if (cur_victim.get() == nullptr) {
                                 cur_victim = head.get();
                         } else {
                                 cur_victim = cur_victim->next.get();
                         }
 
-                        return cur_victim;
+                        return cur_victim.get();
                 }
 
                 void reset_cur_victim()
@@ -147,7 +150,8 @@ class PolicyLRU : public MigrationManager {
                 boost::interprocess::offset_ptr<LRUMeta> head{ nullptr };
                 boost::interprocess::offset_ptr<LRUMeta> tail{ nullptr };
 
-                LRUMeta *cur_victim = nullptr;
+                // Using offset_ptr so this field is position-independent when LRUTracker lives in CXL shared memory.
+                boost::interprocess::offset_ptr<LRUMeta> cur_victim{ nullptr };
 
                 pthread_spinlock_t lru_tracker_lock;
         };
@@ -179,6 +183,8 @@ class PolicyLRU : public MigrationManager {
 
         void init_migration_policy_metadata(void *migration_policy_meta, ITable *table, const void *key, const std::tuple<MetaDataType *, void *> &row, uint64_t metadata_size) override
         {
+                // SAFETY CHECK: row_entity_ptr in LRUMeta is a local-heap VA stored in CXL memory.
+                // Only the owning partition's coordinator may set/read this pointer.
                 LRUMeta *lru_meta = reinterpret_cast<LRUMeta *>(migration_policy_meta);
                 new(lru_meta) LRUMeta();
                 CHECK(lru_meta->row_entity_ptr == nullptr);

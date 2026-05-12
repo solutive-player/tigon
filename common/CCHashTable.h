@@ -58,6 +58,8 @@ class CCHashTable {
 	    public:
                 CCBucket()
                 {
+                        static_assert(sizeof(pthread_spinlock_t) == 4,
+                                      "pthread_spinlock_t ABI changed; verify all nodes use the same glibc version");
                         first_node = nullptr;
                         pthread_spin_init(&latch, PTHREAD_PROCESS_SHARED);
                 }

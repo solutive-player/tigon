@@ -203,6 +203,9 @@ class CXL_EBR {
         EBRMetaCXL cxl_ebr_meta_vec[max_coordinator_num][max_thread_num];
 };
 
+static_assert(std::is_trivially_destructible<CXL_EBR>::value,
+              "CXL_EBR must be trivially destructible — it is placement-new'd into CXL shared memory");
+
 extern CXL_EBR *global_ebr_meta;
 
 } // namespace star

@@ -36,6 +36,8 @@ class CXLTransport {
         }
 
     private:
+        // Node-local VA to CXL-allocated ring buffers, obtained via cxlalloc_get_root translation.
+        // CXLTransport must remain in local DRAM; placing it in CXL would expose this raw VA.
         MPSCRingBuffer *cxl_ringbuffers = nullptr;
 };
 

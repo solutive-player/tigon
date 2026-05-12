@@ -17,6 +17,9 @@ namespace star
 class PolicyFIFO : public MigrationManager {
     public:
         struct FIFOMeta {
+                // SAFETY: same hazard as PolicyLRU::LRUMeta::row_entity_ptr (CXL VA hazard id=4/id=8).
+                // FIFOMeta lives inside TwoPLPashaSharedDataSCC::migration_policy_meta (CXL-allocated).
+                // row_entity_ptr is a local-heap VA, valid only on the owning coordinator.
                 MigrationManager::migrated_row_entity *row_entity_ptr{ nullptr };       // this will be in local DRAM and is only accessed by the owner host
         };
 

@@ -54,6 +54,9 @@ class CXLMemory {
         {
                 cxlalloc_init_backend("ivshmem");
                 cxlalloc_init("SS", default_cxl_mem_size, thread_id + threads_num_per_host * host_id, threads_num_per_host * hosts_num, host_id, hosts_num);
+                // Verify CXL pool fits within the 37-bit SCC_DATA_MASK used in TwoPLPashaMetadataShared.
+                CHECK(default_cxl_mem_size < (1ULL << 37))
+                        << "CXL pool exceeds 128 GB; widen SCC_DATA_MASK in TwoPLPashaMetadataShared";
                 LOG(INFO) << "cxlalloc initialized for thread " << thread_id 
                         << " (global ID = " << thread_id + threads_num_per_host * host_id 
                         << ") on host " << host_id;
@@ -198,6 +201,12 @@ class CXLMemory {
                 }
 
                 *shared_data = addr;
+                // SAFETY: cxlalloc_get_root must return a VA valid in the calling process
+                // (i.e., it translates the stored CXL offset to this process's local VA).
+                // The DCHECK below verifies the returned address is within the CXL-mapped region.
+                { uint64_t _off = 0; DCHECK(cxlalloc_pointer_to_offset(addr, &_off) == true)
+                        << "cxlalloc_get_root returned an address outside the CXL region; "
+                        << "verify cxlalloc performs per-process offset-to-VA translation"; }
         }
 
         uint64_t get_stats(int category)

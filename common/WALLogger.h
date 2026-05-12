@@ -433,6 +433,8 @@ class PashaGroupCommitLoggerSlave : public WALLogger {
     private:
         LogBuffer *cur_log_buffer{ nullptr };
 	LockfreeLogBufferQueue &log_buffer_queue;
+        // Node-local VA obtained via cxlalloc_get_root offset translation. Valid only in this
+        // process. Do NOT place PashaGroupCommitLoggerSlave in CXL shared memory.
         std::atomic<uint64_t> *cxl_global_epoch{ nullptr };
         uint64_t last_epoch{ 0 };
 };

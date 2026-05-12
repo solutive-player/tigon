@@ -18,6 +18,7 @@ namespace star
 class PolicyClock : public MigrationManager {
     public:
         struct ClockMeta {
+                // SAFE: ClockMeta contains no raw pointers. PolicyClock trackers live in local DRAM (not CXL).
                 uint8_t second_chance = 0;
         };
 

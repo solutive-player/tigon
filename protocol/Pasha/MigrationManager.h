@@ -57,6 +57,12 @@ class MigrationManager {
                 }
 
                 static constexpr uint64_t max_key_size = 64;
+                // SAFETY: All pointer fields below are local-DRAM VAs valid only on the owning node.
+                // migrated_row_entity must NEVER be placed in or read from CXL shared memory.
+                // Cross-node access to these fields causes SIGSEGV or silent data corruption.
+                // WARNING: ITable* carries a vtable pointer. If dereferenced on the wrong node,
+                // virtual dispatch will use an invalid VA, causing immediate SIGSEGV or vtable hijack.
+                // TODO: replace with table_id (uint32_t) + partition_id (uint32_t) to eliminate VA dependency.
                 ITable *table{ nullptr };
                 char key[max_key_size];
                 uint64_t metadata_size{ 0 };

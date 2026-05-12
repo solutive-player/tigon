@@ -628,7 +628,6 @@ class BPlusTree {
 		template <typename T = KeyType> typename std::enable_if<std::is_trivial<T>::value == true, void>::type __adjust_elements_in_erase(int pos)
 		{
 			memmove(keys_ + pos, keys_ + pos + 1, sizeof(KeyType) * (this->getCount() - pos - 1));
-			// memmove(values_ + pos, values_ + pos + 1, sizeof(ValueType) * (this->getCount() - pos - 1));
                         for (int i = 0; i < this->getCount() - pos - 1; i++) {
                                 values_[pos + i] = values_[pos + 1 + i];
                         }
