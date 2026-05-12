@@ -1,19 +1,6 @@
 [
   {
-    "category": "本地堆 VA 以 uint64 存入 atomic 元数据字，后续 reinterpret_cast 还原为指针",
-    "description": "TwoPLPashaMetadataLocalInit（TwoPLPashaHelper.cpp:7-9）用 new 在本节点堆上分配 TwoPLPashaMetadataLocal 对象，然后将其虚拟地址强转为 uint64 写入行的 atomic<uint64_t> meta 字段。每次读取 meta.load() 后都会再次 reinterpret_cast 回 TwoPLPashaMetadataLocal*。本地 Table（HashMap/BTree）完全驻留在节点私有 DRAM 中，meta 字段不会被其他节点直接访问，因此当前架构下不会触发跨节点 VA 问题。但一旦 Table 或其 meta 指针被迁移/别名到 CXL 共享内存，其他节点读取到的 uint64 就是节点 A 的 VA，在节点 B 上解引用会立即崩溃或产生静默数据损坏。SundialPashaHelper.cpp 存在完全相同的模式。",
-    "impact": "当前安全。若 Table 的 meta 字段被意外暴露到 CXL 共享内存，其他节点解引用会触发 SIGSEGV 或访问错误地址，导致数据损坏。",
-    "location": "protocol/TwoPLPasha/TwoPLPashaHelper.cpp:7-9, protocol/SundialPasha/SundialPashaHelper.cpp:7-9",
-    "code_pattern": "auto lmeta = new TwoPLPashaMetadataLocal();\nreturn reinterpret_cast<uint64_t>(lmeta);  // 节点本地堆 VA 存为 uint64",
-    "structures": "TwoPLPashaMetadataLocal, SundialPashaMetadataLocal, MetaDataType (std::atomic<uint64_t>)",
-    "steps": [
-      "在 TwoPLPashaMetadataLocalInit / SundialPashaMetadataLocalInit 函数顶部加注释，明确声明该 VA 只能由所属节点的 Worker 访问，禁止将 ITable 或其 meta 数组放入 CXL 共享内存。",
-      "在 meta.load() 的每个调用点后加 DCHECK，验证还原的指针地址落在本进程的 local DRAM 地址区间内（可对比 cxlalloc 的共享区基址判断）。",
-      "若未来需要跨节点共享元数据，改用 cxlalloc_malloc_wrapper 分配 TwoPLPashaMetadataLocal，并将存储的值改为 cxlalloc_pointer_to_offset 返回的偏移量，读取时用 cxlalloc_offset_to_pointer 还原，与 TwoPLPashaMetadataShared::get_scc_data 的现有安全模式保持一致。"
-    ],
-    "passes": false
-  },
-  {
+    "id": 1,
     "category": "CXL 共享结构体中的裸指针字段：TwoPLPashaMetadataLocal::migrated_row",
     "description": "TwoPLPashaMetadataLocal（TwoPLPashaHelper.h:100）有 char *migrated_row{ nullptr }，指向通过 cxlalloc_malloc_wrapper 分配的 TwoPLPashaMetadataShared 对象（CXL 内存中）。TwoPLPashaMetadataLocal 本身在本地堆上，这个裸指针存储的是节点 A 的 VA。其他节点通过 CXL 索引（CCHashTable/BTree 中的 offset_ptr）到达 TwoPLPashaMetadataShared，而非通过此裸指针，因此当前不会跨节点传播这个 VA。但裸指针本身与 CXL 分配内存的偏移耦合缺乏类型保护。",
     "impact": "当前安全。若 TwoPLPashaMetadataLocal 被改为 CXL 分配，migrated_row 中的节点 A VA 将被节点 B 读取并解引用，导致 SIGSEGV 或静默数据损坏。",
@@ -28,6 +15,7 @@
     "passes": false
   },
   {
+    "id": 2,
     "category": "CXL 共享结构体中的裸指针字段：TwoPLPashaMetadataLocal::scc_data",
     "description": "TwoPLPashaMetadataLocal（TwoPLPashaHelper.h:102）有 TwoPLPashaSharedDataSCC *scc_data{ nullptr }，缓存一个指向 CXL 分配的 TwoPLPashaSharedDataSCC 对象的裸 VA。该缓存指针在 set_scc_data 中被赋值（TwoPLPashaHelper.h:1296/1433 附近），仅被所属节点访问。TwoPLPashaMetadataLocal 是本地堆对象，所以这个 VA 不会暴露到 CXL，但模式上存在与 migrated_row 相同的脆弱性。",
     "impact": "当前安全。若 TwoPLPashaMetadataLocal 被移入 CXL，scc_data 中的节点 A VA 被节点 B 解引用会导致 SIGSEGV 或访问错误的 SCC 数据，引发并发控制逻辑错误。",
@@ -42,6 +30,7 @@
     "passes": false
   },
   {
+    "id": 3,
     "category": "CXL 共享结构体中的裸指针字段：SundialPashaMetadataLocal::migrated_row",
     "description": "SundialPashaMetadataLocal（SundialPashaHelper.h:56）有 char *migrated_row{ nullptr }，指向 cxlalloc_malloc_wrapper 分配的 SundialPashaMetadataShared 对象及其紧随其后的行数据。访问时通过 migrated_row + sizeof(SundialPashaMetadataShared) 做偏移计算。SundialPashaMetadataLocal 是本地堆对象，裸指针不直接暴露，但与 TwoPLPasha 的情形一样具有相同的脆弱性。",
     "impact": "当前安全。若结构体被移入 CXL，其他节点解引用节点 A 的 VA 会崩溃。此外，数据偏移硬编码为 sizeof(SundialPashaMetadataShared)，若该结构体大小改变且 CXL 区域未重新初始化，会导致静默数据错位。",
@@ -56,6 +45,7 @@
     "passes": false
   },
   {
+    "id": 4,
     "category": "【高危】CXL 共享结构体 PolicyLRU::LRUMeta 中含裸指针 row_entity_ptr 指向本地堆对象",
     "description": "PolicyLRU::LRUMeta（PolicyLRU.h:23）是 TwoPLPashaSharedDataSCC::migration_policy_meta[24 字节] 数组的一部分，而 TwoPLPashaSharedDataSCC 通过 cxlalloc_malloc_wrapper 分配在 CXL 共享内存中。LRUMeta 的 prev/next 字段使用了正确的 boost::interprocess::offset_ptr，但 row_entity_ptr 字段（类型为 MigrationManager::migrated_row_entity *）是裸指针，指向本地堆上 new 出来的对象（PolicyLRU.h:185）。这个裸 VA 被嵌入在 CXL 共享内存结构体中。任何读取这段 CXL 内存的节点（无论是通过 MigrationManager::move_row_out 中的 LRU 遍历，还是未来的调试工具）一旦解引用 row_entity_ptr，就会在错误的节点上访问节点 A 的本地堆地址，立即崩溃或产生静默损坏。",
     "impact": "【危急】若任何非所有者节点沿 LRU 链表遍历并解引用 row_entity_ptr，会在本节点产生无效内存访问（SIGSEGV）或访问节点 A 的私有数据（静默损坏）。当前通过分区所有权（每个分区只由一个节点调用 move_row_out）隐式保护，但 LRUTracker 上存在 PTHREAD_PROCESS_SHARED 的自旋锁（PolicyLRU.h:36），暗示设计上允许跨节点并发访问，该保护随时可能被破坏。",
@@ -71,20 +61,22 @@
     "passes": false
   },
   {
+    "id": 5,
     "category": "【高危】migrated_row_entity::local_row 含裸指针，结构体可从 CXL 共享内存间接访问",
     "description": "MigrationManager::migrated_row_entity（MigrationManager.h:63）含 std::tuple<MetaDataType *, void *> local_row，其中 MetaDataType* 指向本地 Table 的 atomic<uint64_t> meta 字段，void* 指向本地 Table 的行数据。这两个裸指针在 PolicyLRU::init_migration_policy_metadata 中被赋值（行值来自本节点 Table 的 search 结果）。migrated_row_entity 对象通过 new 分配在本地堆，地址存于 CXL 共享内存中的 LRUMeta::row_entity_ptr（见上一条）。在 move_row_out 中通过 victim_row_entity.table（也是裸指针）和 local_row 直接调用 move_from_shared_region_to_partition 回调。",
-    "impact": "与 Finding #5 联动：若另一节点经 LRU 链表→row_entity_ptr→migrated_row_entity 路径访问 local_row，会解引用节点 A 的本地 DRAM 地址，在节点 B 上产生 SIGSEGV 或写入错误内存。",
+    "impact": "与 id=4 联动：若另一节点经 LRU 链表→row_entity_ptr→migrated_row_entity 路径访问 local_row，会解引用节点 A 的本地 DRAM 地址，在节点 B 上产生 SIGSEGV 或写入错误内存。",
     "location": "protocol/Pasha/MigrationManager.h:60-63",
     "code_pattern": "ITable *table{ nullptr };                            // 裸 VA，本地 ITable 对象（含 vtable）\nstd::tuple<MetaDataType *, void *> local_row;        // 裸 VA，本地 DRAM 中的 meta 和 data 指针",
     "structures": "MigrationManager::migrated_row_entity, PolicyLRU::LRUMeta, ITable",
     "steps": [
-      "【方案一 - 推荐】将 migrated_row_entity 完全移出 CXL 可达路径（见 Finding #5 方案一），存于节点本地 map 中，彻底消除问题根源。",
+      "【方案一 - 推荐】将 migrated_row_entity 完全移出 CXL 可达路径（见 id=4 方案一），存于节点本地 map 中，彻底消除问题根源。",
       "【方案二】如果 migrated_row_entity 必须在 CXL 中，去掉 ITable*，改为存储 table_id（uint32）和 partition_id（uint32），在 move_row_out 调用时通过 database.get_table(table_id, partition_id) 查找本节点的 ITable 指针；local_row 改为存储 CXL 偏移（uint64，通过 cxlalloc_pointer_to_offset 得到），调用时用 cxlalloc_offset_to_pointer 还原。",
       "在 migrated_row_entity 结构体注释中明确标注：'所有裸指针字段只在所属节点有效，禁止跨节点解引用。'"
     ],
     "passes": false
   },
   {
+    "id": 6,
     "category": "【高危】migrated_row_entity::table 为含 vtable 的裸指针，位于可从 CXL 访问的结构体中",
     "description": "MigrationManager::migrated_row_entity::table（MigrationManager.h:60）是 ITable* 类型，ITable 有虚函数（ITable.h 定义了纯虚接口），对象含 vtable 指针。ITable 对象在本地 DRAM 上构造，其 vtable 指针指向本进程的只读代码段。若另一节点读取到这个 ITable* 并调用虚函数，vtable 地址是节点 A 的 VA，会导致节点 B 上的无效内存访问或执行任意代码（vtable 劫持风险）。",
     "impact": "【危急】在错误节点上调用虚函数：立即 SIGSEGV（vtable 地址无效）或执行任意内存位置（严重安全风险）。",
@@ -100,6 +92,7 @@
     "passes": false
   },
   {
+    "id": 7,
     "category": "【高危】PolicyLRU::LRUTracker::cur_victim 为裸指针，字段位于 CXL 分配的共享结构体中",
     "description": "LRUTracker（PolicyLRU.h:140-160）通过 cxlalloc_malloc_wrapper 分配在 CXL 共享内存（PolicyLRU.h:168），其自旋锁使用 PTHREAD_PROCESS_SHARED，设计上允许跨节点并发访问。但 cur_victim 字段类型为 LRUMeta*（裸指针，PolicyLRU.h:150），存储的是调用 get_next_victim 的节点的 VA。若另一节点读取 LRUTracker 并解引用 cur_victim，会访问节点 A 的地址空间。PROCESS_SHARED 自旋锁暗示多节点可能竞争访问同一 LRUTracker。",
     "impact": "【危急】若非所有者节点在加锁后读取 cur_victim 并解引用（如未来扩展移出逻辑到多节点协作场景），立即 SIGSEGV 或静默损坏。即使当前只有所有者节点实际解引用，裸 VA 存于共享内存本身已是隐患。",
@@ -114,6 +107,7 @@
     "passes": false
   },
   {
+    "id": 8,
     "category": "PolicyClock / PolicyFIFO 的 migration_policy_meta 中是否含裸指针需进一步验证",
     "description": "PolicyClock（PolicyClock.h）和 PolicyFIFO（PolicyFIFO.h）也将元数据嵌入 TwoPLPashaSharedDataSCC::migration_policy_meta[24 字节] 数组中（CXL 共享内存）。PolicyLRU 中已发现裸指针问题（LRUMeta::row_entity_ptr）。需要验证 PolicyClock 和 PolicyFIFO 的对应 meta 结构体是否也有类似的裸指针或裸 VA 字段。",
     "impact": "若 PolicyClock/PolicyFIFO 的 meta 结构体中含裸指针，风险与 PolicyLRU 相同：CXL 共享结构体中的裸 VA 被其他节点解引用。",
@@ -122,12 +116,13 @@
     "structures": "PolicyClock, PolicyFIFO, TwoPLPashaSharedDataSCC",
     "steps": [
       "阅读 PolicyClock.h 和 PolicyFIFO.h 中嵌入 migration_policy_meta 的结构体定义，检查所有指针字段。",
-      "对任何裸指针字段，按照 Finding #5/Finding #8 的修复方案，替换为 offset_ptr 或将指针移入节点本地 map。",
+      "对任何裸指针字段，按照 id=4/id=7 的修复方案，替换为 offset_ptr 或将指针移入节点本地 map。",
       "在 CMakeLists 或代码审查 checklist 中加入规则：凡是放入 migration_policy_meta 的结构体，不得含裸指针成员。"
     ],
     "passes": false
   },
   {
+    "id": 9,
     "category": "cxlalloc root 机制的 VA 翻译合约需要明确验证",
     "description": "整个项目中所有跨节点 CXL 指针共享均依赖以下模式：节点 0 用 cxlalloc_malloc_wrapper 分配对象，调用 CXLMemory::commit_shared_data_initialization 存入 cxlalloc root；其他节点调用 wait_and_retrieve_cxl_shared_data 取回 void*，然后 reinterpret_cast 为具体类型。这一模式在 Coordinator.h（全局 epoch、CXL EBR、ring buffer）、PolicyLRU.h（LRUTracker）、Database.h（CXL 表指针）等多处使用。安全性完全依赖 cxlalloc_get_root 对每个调用进程独立执行「偏移→本进程 VA」翻译，而不是直接返回节点 0 的原始 VA。若 cxlalloc_get_root 未做翻译，所有非节点 0 的指针均为无效 VA。",
     "impact": "若 cxlalloc_get_root 不翻译 VA，所有非所有者节点的 CXL 共享对象访问均为无效地址，系统完全不可用。这是整个 CXL 共享内存安全性的基础假设。",
@@ -143,6 +138,7 @@
     "passes": false
   },
   {
+    "id": 10,
     "category": "TwoPLPashaMetadataShared 的 37 位 SCC 偏移掩码可能截断大 CXL 空间的地址",
     "description": "TwoPLPashaMetadataShared（TwoPLPashaHelper.h:282-283）将 TwoPLPashaSharedDataSCC 的 CXL 偏移编码进 atomic_word 的低 37 位（SCC_DATA_MASK = 0x1fffffffffull，最大表示 137 GB）。当前 CXL 最大配置约 31 GB（CXLMemory.h:40 的 default_cxl_mem_size），在 37 位范围内。但若未来扩展 CXL 内存超过 128 GB，cxlalloc_pointer_to_offset 返回的偏移超过 37 位，写入 atomic_word 时被截断，get_scc_data 还原出错误指针，引发静默数据损坏。",
     "impact": "当前配置安全（31 GB << 128 GB）。若 CXL 内存扩展超过 128 GB，get_scc_data 返回错误指针，SCC 协议操作（clflush/clwb）施加在错误地址，导致缓存一致性失效和数据损坏，且无任何错误提示。",
@@ -157,6 +153,7 @@
     "passes": false
   },
   {
+    "id": 11,
     "category": "CXL_EBR 以 placement-new 放入 CXL 共享内存，非平凡成员需注意",
     "description": "Coordinator.h:441-448 将 CXL_EBR 对象 placement-new 到 cxlalloc_malloc_wrapper 分配的 CXL 内存中。CXL_EBR 含 std::atomic<uint64_t> global_epoch 和 EBRMetaCXL cxl_ebr_meta_vec[8][5]（每个含 std::atomic<uint64_t> local_epoch）。这些原子整数在硬件层面是普通整数，可以跨进程共享物理内存安全访问。不含裸指针，不含虚函数，设计上是正确的。但 C++ 标准不保证 std::atomic 在 placement-new 到跨进程共享内存后的 ABI 兼容性（不同编译器版本可能有不同的 atomic 内部结构）。",
     "impact": "在同质化部署（相同 OS、libc、clang 版本）下实际安全。若节点间编译器/libc 版本不同，atomic 的内部 padding 或对齐可能有差异，导致 global_epoch 操作在不同节点上读写不同字节。",
@@ -171,6 +168,7 @@
     "passes": false
   },
   {
+    "id": 12,
     "category": "cxl_table_ptrs 赋值时使用 reinterpret_cast<void*> 中间变量再赋入 offset_ptr——类型不安全",
     "description": "在 tpcc/Database.h:940、ycsb/Database.h:217-226 等处，CXL 分配的 BTree 或 CCHashTable 指针先被 reinterpret_cast<void*>，再赋值给 boost::interprocess::offset_ptr<void> 数组元素。offset_ptr 的赋值运算符接受 void*，内部计算 offset = target_VA - &self。由于 cxl_table_ptrs 数组和目标指针均在同一 cxlalloc 共享区中，偏移计算正确，其他节点 .get() 时可得到本节点有效 VA。当前行为安全。但 reinterpret_cast<void*> 会绕过类型检查，若将来有人把一个本地堆指针错误地赋入 offset_ptr，offset 将是一个巨大的错误值，且无任何编译期提示。",
     "impact": "当前正确。代码意图不清晰，可维护性差。若误赋本地堆指针，会存入错误偏移，其他节点 .get() 得到无效 VA，随后发生 SIGSEGV 或静默读写错误内存。",
@@ -185,8 +183,9 @@
     "passes": false
   },
   {
+    "id": 13,
     "category": "PashaGroupCommitLoggerSlave 持有指向 CXL 共享内存的裸指针 cxl_global_epoch",
-    "description": "PashaGroupCommitLoggerSlave（WALLogger.h:382,436）存储 std::atomic<uint64_t> *cxl_global_epoch，指向 CXL 共享内存中的全局 epoch 计数器。该指针通过 wait_and_retrieve_cxl_shared_data 取回，依赖 cxlalloc root 的 VA 翻译机制（见 Finding #10）。PashaGroupCommitLoggerSlave 本身是节点本地 C++ 对象（在本地堆上构造），不会被其他节点访问。裸指针在本节点内使用是安全的。",
+    "description": "PashaGroupCommitLoggerSlave（WALLogger.h:382,436）存储 std::atomic<uint64_t> *cxl_global_epoch，指向 CXL 共享内存中的全局 epoch 计数器。该指针通过 wait_and_retrieve_cxl_shared_data 取回，依赖 cxlalloc root 的 VA 翻译机制（见 id=9）。PashaGroupCommitLoggerSlave 本身是节点本地 C++ 对象（在本地堆上构造），不会被其他节点访问。裸指针在本节点内使用是安全的。",
     "impact": "当前安全。若 PashaGroupCommitLoggerSlave 被意外放入 CXL 共享内存（例如被某个全局指针数组引用），cxl_global_epoch 裸指针会被其他节点读取，导致跨节点 VA 问题。",
     "location": "common/WALLogger.h:382, 436",
     "code_pattern": "std::atomic<uint64_t> *cxl_global_epoch{ nullptr };  // 裸 VA 指向 CXL 共享内存中的 epoch",
@@ -198,6 +197,7 @@
     "passes": false
   },
   {
+    "id": 14,
     "category": "CXLTransport 持有 MPSCRingBuffer* 裸指针指向 CXL 共享内存",
     "description": "CXLTransport（CXLTransport.h:39）有 MPSCRingBuffer *cxl_ringbuffers = nullptr，指向 CXL 分配的 ring buffer 数组。CXLTransport 是节点本地对象，cxl_ringbuffers 通过 cxlalloc root VA 翻译取回，在本节点使用是安全的。MPSCRingBuffer 内部的 entries_buffer 已正确使用 offset_ptr<char>。",
     "impact": "当前安全。若 CXLTransport 被放入共享内存，cxl_ringbuffers 裸指针会暴露给其他节点。",
@@ -211,6 +211,7 @@
     "passes": false
   },
   {
+    "id": 15,
     "category": "CCHashTable/LRUTracker 使用 PTHREAD_PROCESS_SHARED 自旋锁，依赖 ABI 同质化",
     "description": "CCBucket（CCHashTable.h:62）、SundialPashaMetadataShared（SundialPashaHelper.h:72）和 PolicyLRU::LRUTracker（PolicyLRU.h:36）在 CXL 共享内存中使用 PTHREAD_PROCESS_SHARED 的 pthread_spinlock_t。这是正确的跨进程同步原语。但 pthread_spinlock_t 的内存布局是 glibc 实现细节，不同 glibc 版本可能不同。若不同节点上的 glibc 版本不同，同一 CXL 地址上的 spinlock 在不同节点上会被解析为不同布局，导致死锁或竞态条件。",
     "impact": "在同质化节点（相同 glibc 版本）下安全。不同版本节点下可能死锁或竞争失效，难以复现和调试。",
@@ -225,8 +226,9 @@
     "passes": false
   },
   {
+    "id": 16,
     "category": "BTreeOLC_CXL BTreeLeaf 中对含 atomic<bool> 的 BTreeOLCValue 曾有 memmove 调用（已注释但需确认）",
-    "description": "CXLTable.h:91-109 中 BTreeOLCValue 含 boost::interprocess::offset_ptr<void> row 和 std::atomic<bool> is_valid，定义了自定义拷贝构造和赋值运算符以正确重算 offset_ptr 的偏移。BTreeOLC_CXL.h:628-634 中有一段被注释掉的 memmove 代码（对 values_[] 数组做字节拷贝），已改为 for 循环使用自定义 operator= 。memmove std::atomic 对象属于 C++ 未定义行为（atomic 不是 trivially copyable）。",
+    "description": "CXLTable.h:91-109 中 BTreeOLCValue 含 boost::interprocess::offset_ptr<void> row 和 std::atomic<bool> is_valid，定义了自定义拷贝构造和赋值运算符以正确重算 offset_ptr 的偏移。BTreeOLC_CXL.h:628-634 中有一段被注释掉的 memmove 代码（对 values_[] 数组做字节拷贝），已改为 for 循环使用自定义 operator=。memmove std::atomic 对象属于 C++ 未定义行为（atomic 不是 trivially copyable）。",
     "impact": "当前不存在该 UB（memmove 已注释），但若将来有人恢复注释或在其他地方做类似操作，会产生未定义行为（可能导致 atomic 状态异常，CXL 共享节点上的并发行为不可预期）。",
     "location": "common/btree_olc_cxl/BTreeOLC_CXL.h:628-634, core/CXLTable.h:91-109",
     "code_pattern": "// memmove(values_ + pos, values_ + pos + 1, sizeof(ValueType) * (...));  // 已注释，禁止恢复\nfor (int i = 0; ...) { values_[pos + i] = values_[pos + 1 + i]; }  // 正确使用自定义 operator=",
@@ -238,6 +240,7 @@
     "passes": false
   },
   {
+    "id": 17,
     "category": "SundialPashaMetadataShared 数据区通过 sizeof 偏移访问，结构体大小变化会静默破坏数据布局",
     "description": "SundialPashaHelper.h:142、159 用 migrated_row + sizeof(SundialPashaMetadataShared) 访问紧随 SundialPashaMetadataShared 头部之后的行数据区。CXL 分配时大小为 sizeof(SundialPashaMetadataShared) + value_size（SundialPashaHelper.h:448）。若 SundialPashaMetadataShared 结构体大小因添加字段而改变，且 CXL 内存区域中已有旧格式数据，新代码将以错误偏移读写行数据，产生静默数据损坏。两次运行之间若不清空 CXL 内存，旧布局和新布局会共存。",
     "impact": "结构体修改后若 CXL 内存未重置，所有后续读写都是错误数据，且无任何运行时报错。在性能测试场景下可能运行较长时间才暴露。",
