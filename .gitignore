@@ -14,3 +14,4 @@ root.img.manifest
 qemu_log*.txt
 OVMF_VARS.fd
 pid
+.claude/worktrees/
