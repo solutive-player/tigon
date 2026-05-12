@@ -219,7 +219,8 @@ class Database {
                         for (int i = 0; i < partitionNum; i++) {
                                 auto cxl_table = &ycsb_cxl_btreetables[i];
                                 new(cxl_table) CXLTableBTreeOLC<ycsb::key, ycsb::KeyComparator>::CXLBTree();
-                                cxl_table_ptrs[ycsbTableID * partitionNum + i] = reinterpret_cast<void *>(cxl_table);
+                                { uint64_t _off = 0; DCHECK(cxlalloc_pointer_to_offset(cxl_table, &_off) == true) << "cxl_table must be CXL-allocated for offset_ptr to be valid"; }
+                                cxl_table_ptrs[ycsbTableID * partitionNum + i] = static_cast<void *>(cxl_table);
                                 cxl_tbl_vecs[ycsbTableID][i] = new CXLTableBTreeOLC<ycsb::key, ycsb::KeyComparator>(cxl_table, ycsbTableID, i);
                         }
 

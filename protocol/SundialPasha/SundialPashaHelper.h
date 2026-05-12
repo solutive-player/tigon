@@ -103,7 +103,15 @@ struct SundialPashaMetadataShared {
 
         // next-key information
         bool is_next_key_real{ false };
+
+        // Data payload follows immediately after this header in the CXL allocation.
+        // Using a flexible array member makes the offset compile-time-fixed and immune
+        // to accidental struct size changes (see: sizeof-offset hazard).
+        char data[];
 };
+
+static_assert(std::is_trivially_destructible<SundialPashaMetadataShared>::value,
+              "SundialPashaMetadataShared must be trivially destructible for CXL placement");
 
 uint64_t SundialPashaMetadataLocalInit(bool is_tuple_valid);
 
@@ -139,7 +147,7 @@ class SundialPashaHelper {
                         local_cxl_access.fetch_add(1);
 
                         SundialPashaMetadataShared *smeta = reinterpret_cast<SundialPashaMetadataShared *>(lmeta->migrated_row);
-                        void *src = lmeta->migrated_row + sizeof(SundialPashaMetadataShared);
+                        void *src = smeta->data;
                         smeta->lock();
                         CHECK(smeta->is_valid == true);
                         rts = smeta->rts;
@@ -156,7 +164,7 @@ class SundialPashaHelper {
 	std::pair<uint64_t, uint64_t> remote_read(char *row, void *dest, std::size_t size)
 	{
 		SundialPashaMetadataShared *smeta = reinterpret_cast<SundialPashaMetadataShared *>(row);
-                void *src = row + sizeof(SundialPashaMetadataShared);
+                void *src = smeta->data;
                 uint64_t rts = 0, wts = 0;
 
 		smeta->lock();
@@ -305,11 +313,10 @@ out_lmeta_unlock:
                         lmeta->wts = lmeta->rts = commit_ts;
                 } else {
                         SundialPashaMetadataShared *smeta = reinterpret_cast<SundialPashaMetadataShared *>(lmeta->migrated_row);
-                        void *data_ptr = lmeta->migrated_row + sizeof(SundialPashaMetadataShared);
                         smeta->lock();
                         CHECK(smeta->is_valid == true);
                         CHECK(smeta->owner == transaction_id);
-                        scc_manager->do_write(&smeta->scc_meta, coordinator_id, data_ptr, value, value_size);
+                        scc_manager->do_write(&smeta->scc_meta, coordinator_id, smeta->data, value, value_size);
                         smeta->wts = smeta->rts = commit_ts;
                         smeta->unlock();
                 }
@@ -320,13 +327,12 @@ out_lmeta_unlock:
 			   uint64_t transaction_id)
 	{
 		SundialPashaMetadataShared *smeta = reinterpret_cast<SundialPashaMetadataShared *>(row);
-                void *data_ptr = row + sizeof(SundialPashaMetadataShared);
 
                 smeta->lock();
                 CHECK(smeta->is_valid == true);
                 CHECK(smeta->ref_cnt > 0);
                 CHECK(smeta->owner == transaction_id);
-                scc_manager->do_write(&smeta->scc_meta, coordinator_id, data_ptr, value, value_size);
+                scc_manager->do_write(&smeta->scc_meta, coordinator_id, smeta->data, value, value_size);
                 smeta->wts = smeta->rts = commit_ts;
                 smeta->unlock();
 	}
@@ -445,7 +451,6 @@ out_lmeta_unlock:
                         std::size_t row_total_size = sizeof(SundialPashaMetadataShared) + table->value_size();
                         char *migrated_row_ptr = reinterpret_cast<char *>(cxl_memory.cxlalloc_malloc_wrapper(row_total_size,
                                 CXLMemory::DATA_ALLOCATION, sizeof(SundialPashaMetadataShared), table->value_size()));
-                        char *migrated_row_value_ptr = migrated_row_ptr + sizeof(SundialPashaMetadataShared);
                         SundialPashaMetadataShared *smeta = reinterpret_cast<SundialPashaMetadataShared *>(migrated_row_ptr);
                         new(smeta) SundialPashaMetadataShared();
 
@@ -465,7 +470,7 @@ out_lmeta_unlock:
                         smeta->owner = lmeta->owner;
 
                         // copy data
-                        scc_manager->do_write(&smeta->scc_meta, coordinator_id, migrated_row_value_ptr, local_data, table->value_size());
+                        scc_manager->do_write(&smeta->scc_meta, coordinator_id, smeta->data, local_data, table->value_size());
 
                         // set the migrated row as valid
                         smeta->is_valid = true;
@@ -481,6 +486,7 @@ out_lmeta_unlock:
                         CHECK(insert_ret == true);
 
                         // mark the local row as migrated
+                        { uint64_t _off = 0; DCHECK(cxlalloc_pointer_to_offset(migrated_row_ptr, &_off) == true) << "migrated_row target must be CXL-allocated"; }
                         lmeta->migrated_row = migrated_row_ptr;
                         lmeta->is_migrated = true;
 
@@ -544,7 +550,6 @@ out_lmeta_unlock:
                                 std::size_t row_total_size = sizeof(SundialPashaMetadataShared) + table->value_size();
                                 char *migrated_row_ptr = reinterpret_cast<char *>(cxl_memory.cxlalloc_malloc_wrapper(row_total_size,
                                                 CXLMemory::DATA_ALLOCATION, sizeof(SundialPashaMetadataShared), table->value_size()));
-                                char *migrated_row_value_ptr = migrated_row_ptr + sizeof(SundialPashaMetadataShared);
                                 SundialPashaMetadataShared *smeta = reinterpret_cast<SundialPashaMetadataShared *>(migrated_row_ptr);
                                 new(smeta) SundialPashaMetadataShared();
 
@@ -564,7 +569,7 @@ out_lmeta_unlock:
                                 smeta->owner = lmeta->owner;
 
                                 // copy data
-                                scc_manager->do_write(&smeta->scc_meta, coordinator_id, migrated_row_value_ptr, local_data, table->value_size());
+                                scc_manager->do_write(&smeta->scc_meta, coordinator_id, smeta->data, local_data, table->value_size());
 
                                 // set the migrated row as valid
                                 smeta->is_valid = true;
@@ -587,6 +592,7 @@ out_lmeta_unlock:
                                 CHECK(insert_ret == true);
 
                                 // mark the local row as migrated
+                                { uint64_t _off = 0; DCHECK(cxlalloc_pointer_to_offset(migrated_row_ptr, &_off) == true) << "migrated_row target must be CXL-allocated"; }
                                 lmeta->migrated_row = migrated_row_ptr;
                                 lmeta->is_migrated = true;
 
@@ -661,7 +667,6 @@ out_lmeta_unlock:
                 CHECK(lmeta->is_valid == true);
                 if (lmeta->is_migrated == true) {
                         SundialPashaMetadataShared *smeta = reinterpret_cast<SundialPashaMetadataShared *>(lmeta->migrated_row);
-                        char *migrated_row_value = lmeta->migrated_row + sizeof(SundialPashaMetadataShared);
 
                         // take the CXL latch
                         smeta->lock();
@@ -682,7 +687,7 @@ out_lmeta_unlock:
                         lmeta->owner = smeta->owner;
 
                         // copy data back
-                        scc_manager->do_read(&smeta->scc_meta, coordinator_id, local_data, migrated_row_value, table->value_size());
+                        scc_manager->do_read(&smeta->scc_meta, coordinator_id, local_data, smeta->data, table->value_size());
 
                         // set the migrated row as invalid
                         smeta->is_valid = false;
@@ -735,7 +740,6 @@ out_lmeta_unlock:
                         CHECK(lmeta->is_valid == true);
                         if (lmeta->is_migrated == true) {
                                 SundialPashaMetadataShared *smeta = reinterpret_cast<SundialPashaMetadataShared *>(lmeta->migrated_row);
-                                char *migrated_row_value = lmeta->migrated_row + sizeof(SundialPashaMetadataShared);
 
                                 // take the CXL latch
                                 smeta->lock();
@@ -757,7 +761,7 @@ out_lmeta_unlock:
                                 lmeta->owner = smeta->owner;
 
                                 // copy data back
-                                scc_manager->do_read(&smeta->scc_meta, coordinator_id, local_data, migrated_row_value, table->value_size());
+                                scc_manager->do_read(&smeta->scc_meta, coordinator_id, local_data, smeta->data, table->value_size());
 
                                 // set the migrated row as invalid
                                 smeta->is_valid = false;

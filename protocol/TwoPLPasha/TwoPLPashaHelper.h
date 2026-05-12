@@ -109,6 +109,7 @@ struct TwoPLPashaMetadataShared {
 
                 bool ret = cxlalloc_pointer_to_offset(scc_data, &scc_data_cxl_offset);
                 DCHECK(ret == true);
+                DCHECK((scc_data_cxl_offset & ~SCC_DATA_MASK) == 0) << "CXL offset exceeds 37-bit SCC_DATA_MASK; reduce CXL pool size or widen the mask";
 
                 atomic_word.store(scc_data_cxl_offset << SCC_DATA_OFFSET, std::memory_order_release);
         }
@@ -1293,6 +1294,7 @@ out_unlock_lmeta:
                                         return res;
                                 }
 
+                                { uint64_t _off = 0; DCHECK(cxlalloc_pointer_to_offset(scc_data, &_off) == true) << "scc_data must be CXL-allocated"; }
                                 lmeta->scc_data = scc_data;
                         } else {
                                 // we have a cached copy in CXL - reuse it
@@ -1344,6 +1346,7 @@ out_unlock_lmeta:
                         DCHECK(insert_ret == true);
 
                         // mark the local row as migrated
+                        { uint64_t _off = 0; DCHECK(cxlalloc_pointer_to_offset(smeta, &_off) == true) << "migrated_row target must be CXL-allocated"; }
                         lmeta->migrated_row = reinterpret_cast<char *>(smeta);
                         lmeta->is_migrated = true;
 
@@ -1430,6 +1433,7 @@ out_unlock_lmeta:
                                                 return;
                                         }
 
+                                        { uint64_t _off = 0; DCHECK(cxlalloc_pointer_to_offset(cur_scc_data, &_off) == true) << "scc_data must be CXL-allocated"; }
                                         cur_lmeta->scc_data = cur_scc_data;
                                 } else {
                                         // we have a cached copy in CXL - reuse it
@@ -1495,6 +1499,7 @@ out_unlock_lmeta:
                                 DCHECK(insert_ret == true);
 
                                 // mark the local row as migrated
+                                { uint64_t _off = 0; DCHECK(cxlalloc_pointer_to_offset(cur_smeta, &_off) == true) << "migrated_row target must be CXL-allocated"; }
                                 cur_lmeta->migrated_row = reinterpret_cast<char *>(cur_smeta);
                                 cur_lmeta->is_migrated = true;
 

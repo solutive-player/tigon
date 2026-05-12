@@ -937,7 +937,8 @@ class Database {
                         for (int i = 0; i < partitionNum; i++) {
                                 auto cxl_table = &customer_cxl_btreetables[i];
                                 new(cxl_table) CXLTableBTreeOLC<customer::key, customer::KeyComparator>::CXLBTree();
-                                cxl_table_ptrs[customerTableID * partitionNum + i] = reinterpret_cast<void *>(cxl_table);
+                                { uint64_t _off = 0; DCHECK(cxlalloc_pointer_to_offset(cxl_table, &_off) == true) << "cxl_table must be CXL-allocated for offset_ptr to be valid"; }
+                                cxl_table_ptrs[customerTableID * partitionNum + i] = static_cast<void *>(cxl_table);
                                 cxl_tbl_vecs[customerTableID][i] = new CXLTableBTreeOLC<customer::key, customer::KeyComparator>(cxl_table, customerTableID, i);
                         }
 
@@ -1025,7 +1026,8 @@ class Database {
                         for (int i = 0; i < partitionNum; i++) {
                                 auto cxl_table = &stock_cxl_btreetables[i];
                                 new(cxl_table) CXLTableBTreeOLC<stock::key, stock::KeyComparator>::CXLBTree();
-                                cxl_table_ptrs[stockTableID * partitionNum + i] = reinterpret_cast<void *>(cxl_table);
+                                { uint64_t _off = 0; DCHECK(cxlalloc_pointer_to_offset(cxl_table, &_off) == true) << "cxl_table must be CXL-allocated for offset_ptr to be valid"; }
+                                cxl_table_ptrs[stockTableID * partitionNum + i] = static_cast<void *>(cxl_table);
                                 cxl_tbl_vecs[stockTableID][i] = new CXLTableBTreeOLC<stock::key, stock::KeyComparator>(cxl_table, stockTableID, i);
                         }
 

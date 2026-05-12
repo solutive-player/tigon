@@ -12,7 +12,7 @@
       "或者，将 uint64 CXL 偏移（通过 cxlalloc_pointer_to_offset 获取）存入 migrated_row 对应字段，访问时用 cxlalloc_offset_to_pointer 还原，与 TwoPLPashaMetadataShared 中 scc_data 的编码方式一致。",
       "在赋值 migrated_row 前加 DCHECK，确认目标地址确实在 CXL 共享内存区间内（调用 cxlalloc_pointer_to_offset 验证）。"
     ],
-    "passes": false
+    "passes": true
   },
   {
     "id": 2,
@@ -27,7 +27,7 @@
       "或改为 boost::interprocess::offset_ptr<TwoPLPashaSharedDataSCC>，利用其隐式偏移计算。",
       "在 set_scc_data 赋值前加 DCHECK，确认地址在 CXL 区间内。"
     ],
-    "passes": false
+    "passes": true
   },
   {
     "id": 3,
@@ -42,7 +42,7 @@
       "加 static_assert(sizeof(SundialPashaMetadataShared) == EXPECTED_SIZE) 防止结构体大小悄然变化导致数据错位。",
       "若 SundialPashaMetadataLocal 将来需放入 CXL，将 migrated_row 改为 boost::interprocess::offset_ptr<SundialPashaMetadataShared> 或存储 CXL 偏移量。"
     ],
-    "passes": false
+    "passes": true
   },
   {
     "id": 4,
@@ -58,7 +58,7 @@
       "【方案三 - 最小改动】在 init_migration_policy_metadata 和 move_row_out 的入口加 DCHECK，断言 coordinator_id 等于当前分区的所有者节点 ID，确保非所有者节点绝对不会访问 row_entity_ptr。同时加注释说明这是安全关键约束。",
       "无论选择哪种方案，都应将 LRUMeta 的 row_entity_ptr 声明为 [[deprecated]] 或在注释中加醒目警告，防止未来开发者在其他上下文中解引用。"
     ],
-    "passes": false
+    "passes": true
   },
   {
     "id": 5,
@@ -73,7 +73,7 @@
       "【方案二】如果 migrated_row_entity 必须在 CXL 中，去掉 ITable*，改为存储 table_id（uint32）和 partition_id（uint32），在 move_row_out 调用时通过 database.get_table(table_id, partition_id) 查找本节点的 ITable 指针；local_row 改为存储 CXL 偏移（uint64，通过 cxlalloc_pointer_to_offset 得到），调用时用 cxlalloc_offset_to_pointer 还原。",
       "在 migrated_row_entity 结构体注释中明确标注：'所有裸指针字段只在所属节点有效，禁止跨节点解引用。'"
     ],
-    "passes": false
+    "passes": true
   },
   {
     "id": 6,
@@ -89,7 +89,7 @@
       "修改 PolicyLRU::init_migration_policy_metadata、PolicyClock、PolicyFIFO 等所有构造 migrated_row_entity 的地方，改传 table_id 和 partition_id。",
       "修改 MigrationManager::move_row_out（及其回调 move_from_shared_region_to_partition）的签名，将 table lookup 逻辑从 entity 内联改为调用方查找。"
     ],
-    "passes": false
+    "passes": true
   },
   {
     "id": 7,
@@ -104,7 +104,7 @@
       "【方案二】将 cur_victim 移出 LRUTracker，放入节点本地 std::unordered_map<uint64_t, LRUMeta*>（以 LRUTracker CXL 偏移为 key）。LRUTracker 结构体中不保存任何裸指针。",
       "无论采用哪种方案，在 get_next_victim 入口加 DCHECK 确认调用节点与分区所有者匹配，作为防御性断言。"
     ],
-    "passes": false
+    "passes": true
   },
   {
     "id": 8,
@@ -119,7 +119,7 @@
       "对任何裸指针字段，按照 id=4/id=7 的修复方案，替换为 offset_ptr 或将指针移入节点本地 map。",
       "在 CMakeLists 或代码审查 checklist 中加入规则：凡是放入 migration_policy_meta 的结构体，不得含裸指针成员。"
     ],
-    "passes": false
+    "passes": true
   },
   {
     "id": 9,
@@ -135,7 +135,7 @@
       "在每个 reinterpret_cast 调用点上方加注释：'cxlalloc_get_root 返回的是本进程 VA（经偏移翻译），非节点 0 的原始 VA'，明确合约。",
       "若验证发现 cxlalloc_get_root 直接返回节点 0 VA，则所有调用点必须改为：取回 uint64 偏移，用 cxlalloc_offset_to_pointer 本地翻译后再 reinterpret_cast。"
     ],
-    "passes": false
+    "passes": true
   },
   {
     "id": 10,
@@ -150,7 +150,7 @@
       "或将 SCC_DATA_MASK 改为 uint64_t 全宽（去掉位域打包），将 scc_data 偏移存入独立的 std::atomic<uint64_t> 字段，彻底消除截断风险，代价是每行多 8 字节 CXL 内存。",
       "若保持位域打包，在 set_scc_data 写入前加 DCHECK((offset & ~SCC_DATA_MASK) == 0) 检测截断。"
     ],
-    "passes": false
+    "passes": true
   },
   {
     "id": 11,
@@ -165,7 +165,7 @@
       "加 static_assert(std::is_trivially_destructible<CXL_EBR>::value) 防止析构函数被意外调用在错误节点上。",
       "将 std::atomic<uint64_t> 替换为 _Atomic uint64_t（C11 原子，ABI 更稳定）或手动实现基于 CAS 的原子操作，减少编译器版本依赖。"
     ],
-    "passes": false
+    "passes": true
   },
   {
     "id": 12,
@@ -180,7 +180,7 @@
       "在每次赋值前加 DCHECK，通过 cxlalloc_pointer_to_offset 验证 cxl_table 确实在 CXL 区间内：auto off = cxlalloc_pointer_to_offset(cxl_table); DCHECK(off != INVALID_OFFSET);",
       "在 create_or_retrieve_cxl_tables 函数头部注释中明确：cxl_table_ptrs 中只能存放 CXL 分配的指针，否则 offset_ptr 语义失效。"
     ],
-    "passes": false
+    "passes": true
   },
   {
     "id": 13,
@@ -194,7 +194,7 @@
       "在字段上加注释：'节点本地 VA，通过 cxlalloc root 翻译获得，只在本进程中有效'。",
       "若将来 WALLogger 需要放入共享内存，将此字段改为存储 CXL 偏移（uint64），访问时调用 cxlalloc_offset_to_pointer。"
     ],
-    "passes": false
+    "passes": true
   },
   {
     "id": 14,
@@ -208,7 +208,7 @@
       "加注释：'节点本地 VA，禁止将 CXLTransport 放入 CXL 共享内存'。",
       "若未来需要共享，改为 boost::interprocess::offset_ptr<MPSCRingBuffer> 或存储 CXL 偏移。"
     ],
-    "passes": false
+    "passes": true
   },
   {
     "id": 15,
@@ -223,7 +223,7 @@
       "或明确要求所有节点使用完全相同的 glibc 版本，并在系统启动时通过 setup.sh 验证。",
       "加 static_assert(sizeof(pthread_spinlock_t) == EXPECTED_SIZE) 作为版本一致性检查（该值在特定 glibc 版本上是固定的）。"
     ],
-    "passes": false
+    "passes": true
   },
   {
     "id": 16,
@@ -237,7 +237,7 @@
       "删除被注释掉的 memmove 行，避免未来被意外恢复。",
       "在 BTreeOLCValue 上加 static_assert(!std::is_trivially_copyable<BTreeOLCValue>::value) 强制要求使用自定义拷贝，编译期阻止 memmove 误用。"
     ],
-    "passes": false
+    "passes": true
   },
   {
     "id": 17,
@@ -252,6 +252,6 @@
       "加 static_assert(sizeof(SundialPashaMetadataShared) == EXPECTED_FIXED_SIZE) 防止结构体意外增大。",
       "在 CXL 内存初始化时写入一个版本标识（magic number + struct sizes），在 wait_and_retrieve 阶段验证布局与当前二进制一致，不一致时 LOG(FATAL) 要求清空重建。"
     ],
-    "passes": false
+    "passes": true
   }
 ]

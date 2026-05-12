@@ -108,6 +108,9 @@ template <class KeyType, class KeyComparator> class CXLTableBTreeOLC : public CX
                 std::atomic<bool> is_valid{ false };
         };
 
+        static_assert(!std::is_trivially_copyable<BTreeOLCValue>::value,
+                      "BTreeOLCValue is not trivially copyable; use the custom operator= loop, not memmove");
+
         struct BTreeOLCValueComparator {
                 int operator()(const BTreeOLCValue &a, const BTreeOLCValue &b) const
                 {
