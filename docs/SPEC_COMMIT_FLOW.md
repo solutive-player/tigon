@@ -461,157 +461,360 @@ gantt
 
 ---
 
-## 9. WAL 与 epoch-based group commit（持久化子系统）
+## 9. WALLogger 深度剖析：redo 日志如何经队列落盘
 
-文件：`common/WALLogger.h`。这是 commit 的“持久化后端”，决定了 worker 写入的 redo / commit record 何时真正落盘。
+文件：`common/WALLogger.h`（744 行）+ `common/LockfreeQueue.h`。这是 commit 的“持久化后端”，决定 worker 在 commit 中写入的 **redo 记录 / commit record** 何时、以何种路径真正落到磁盘。本节给出文件写入层、无锁队列、主从 logger 的完整源码级剖析与端到端数据流。
 
-### 8.1 Logger 类层次
+### 9.1 组件全景与类层次
+
+`WALLogger.h` 内定义了 **2 个文件写入器 + 1 个抽象基类 + 5 个 logger 实现**：
 
 ```mermaid
 classDiagram
     class WALLogger {
         <<abstract>>
-        +write(str,size,persist,start_time,on_blocking) size_t
-        +sync(lsn,on_blocking)
+        +write(str, size, persist, txn_start_time, on_blocking) size_t
+        +sync(lsn, on_blocking) void
+        +close() void
         +get_global_epoch() uint64_t
-        +print_sync_stats()
-        #filename
-        #emulated_persist_latency
+        +print_sync_stats() void
+    }
+    class DirectFileWriter {
+        +write(str, size) void
+        +sync() void
+        +roundUp(n, multiple) size_t
+        -int fd_O_DIRECT
+        -size_t block_size
+    }
+    class BufferedDirectFileWriter {
+        +write(str, size) void
+        +flush() size_t
+        +sync() size_t
+        -char_ptr buffer_4MB
+        -size_t bytes_total
     }
     WALLogger <|-- BlackholeLogger
-    WALLogger <|-- GroupCommitLogger
     WALLogger <|-- SimpleWALLogger
+    WALLogger <|-- GroupCommitLogger
     WALLogger <|-- PashaGroupCommitLoggerSlave
     WALLogger <|-- PashaGroupCommitLogger
-    PashaGroupCommitLogger ..> PashaGroupCommitLoggerSlave : 通过 LockfreeLogBufferQueue 汇聚
+    BlackholeLogger *-- BufferedDirectFileWriter
+    SimpleWALLogger *-- BufferedDirectFileWriter
+    GroupCommitLogger *-- BufferedDirectFileWriter
+    PashaGroupCommitLogger *-- DirectFileWriter
+    PashaGroupCommitLoggerSlave ..> PashaGroupCommitLogger : LockfreeLogBufferQueue
 ```
 
-| 类 | 角色 | 是否落盘 |
-|----|------|----------|
-| `BlackholeLogger` | 丢弃（`LOGGING_TYPE=BLACKHOLE` 或 checkpoint 模式） | 否 |
-| `SimpleWALLogger` | 每事务同步 fsync（非 group） | 是（同步） |
-| `GroupCommitLogger` | 单机 count/latency 混合 group commit | 是（批量） |
-| `PashaGroupCommitLoggerSlave` | **每 worker 一个**，仅缓冲 + 入队 | 否（交给 master） |
-| `PashaGroupCommitLogger` | **每主机一个 master 线程**，drain 队列 + fsync | 是（epoch 边界） |
+| 类 | 源码行 | 角色 | 写入器 | 触发落盘的条件 |
+|----|--------|------|--------|----------------|
+| `WALLogger` | `:194-221` | 抽象基类，纯虚 `write/sync/close` | — | — |
+| `BlackholeLogger` | `:223-252` | `LOGGING_TYPE=BLACKHOLE` 时丢弃日志，`write` 直接 `return 0` | `BufferedDirectFileWriter` | 从不（基准对照） |
+| `SimpleWALLogger` | `:588-627` | 非 group：每次 `persist` 即 `writer.sync()` | `BufferedDirectFileWriter` | 每个持久化写 |
+| `GroupCommitLogger` | `:254-362` | **单机** count/latency 混合 group commit，后台 detach 线程 | `BufferedDirectFileWriter` | `waiting_syncs≥cnt` 或超时 |
+| `PashaGroupCommitLoggerSlave` | `:377-438` | **每 worker 一个**，只 memcpy 进 `LogBuffer` 并按 epoch 入队 | 无（不落盘） | 从不（交给 master） |
+| `PashaGroupCommitLogger` | `:440-586` | **每主机一个 master 线程**，drain 所有队列 + `write+fdatasync` | `DirectFileWriter` | 每 `EPOCH_LEN` |
 
-`LOGGING_TYPE=GROUP_WAL` 时使用 **Slave + Master 组合**（Tigon 默认）。
+> Tigon 默认（`LOGGING_TYPE=GROUP_WAL`）使用 **`PashaGroupCommitLoggerSlave`（生产者）+ `PashaGroupCommitLogger`（消费者）** 组合，经 `LockfreeLogBufferQueue` 连接。下文聚焦这条路径；`GroupCommitLogger` 为单机变体，附在 §9.10 对比。
 
-### 8.2 装配（Coordinator）
+### 9.2 文件写入层
 
-源码：`core/Coordinator.h:55-95, 208-211`
-
-```
-context.log_path != "" && wal_group_commit_time != 0
-└─ coordinator_id==0: 在 CXL 分配 cxl_global_epoch, commit_shared_data_initialization
-   else            : wait_and_retrieve_cxl_shared_data 获取同一指针   (Coordinator.h:66-74)
-└─ for i in worker_num:                                               (Coordinator.h:78-82)
-     log_buffer_queues[i] = new LockfreeLogBufferQueue
-     slave_loggers[i]     = new PashaGroupCommitLoggerSlave(queue, cxl_global_epoch)
-└─ master_logger = new PashaGroupCommitLogger(redo_filename, log_buffer_queues,
-                       cxl_global_epoch, ioStopFlag, group_commit_batch_size,
-                       wal_group_commit_time, emulated_persist_latency)   (Coordinator.h:83)
-└─ logger_threads[0] = thread(&PashaGroupCommitLogger::start, master_logger) (Coordinator.h:210)
-   pin_thread_to_core(logger_threads[0])
-```
-
-每个 `TwoPLPashaExecutor` 通过 `context.slave_loggers[id]` 拿到自己的从 logger（`core/Executor.h:60-72`），`txn.set_logger()` 绑定。
-
-### 8.3 数据结构
+#### DirectFileWriter（master 使用，`:26-73`）
 
 ```cpp
-struct LogBuffer {                                  // WALLogger.h
-    static constexpr uint64_t max_buffer_size = 4MB;
-    char buffer[max_buffer_size];
-    uint64_t size = 0;
-    std::vector<uint64_t> txn_start_times;          // 用于回算事务延迟
+DirectFileWriter(const char *filename, std::size_t block_size, ...) {
+    long flags = O_WRONLY | O_CREAT | O_TRUNC | O_DIRECT;     // :32 绕过 page cache
+    fd = open(filename, flags, ...); CHECK(fd >= 0);
+}
+void write(const char *str, long size) {
+    ::write(fd, str, roundUp(size, block_size));             // :43 写入按 block 对齐取整
+}
+void sync() { fdatasync(fd); }                               // :58-61 仅刷数据(不刷元数据)
+```
+
+要点：
+- **`O_DIRECT`**：绕过 OS page cache 直写设备，避免双缓冲，但要求 **写入大小/偏移按 `block_size`（默认 4096）对齐**——故 `write` 用 `roundUp(size, block_size)`（`:46-56`）向上取整到块边界。
+- `sync()` 用 `fdatasync`（只持久化数据块，不含 inode 时间戳等元数据），比 `fsync` 轻。
+
+#### BufferedDirectFileWriter（单机 logger 使用，`:75-192`）
+
+- 4MB 对齐缓冲：`posix_memalign(&buffer, block_size, BUFFER_SIZE=4MB)`（`:90, :184`）。
+- `write`（`:98-124`）：先 memcpy 进缓冲；满 4MB 时 `flush()`。
+- `flush`（`:138-159`）：`::write(fd, buffer, roundUp(bytes_total, block_size))` + `fdatasync(fd)`，返回刷出字节数。
+- `sync`（`:161-174`）：= `flush()`（若设 `emulated_persist_latency` 则额外 sleep 模拟慢盘）。
+
+### 9.3 无锁队列 LockfreeLogBufferQueue
+
+源码 `common/LockfreeQueue.h:24-55` + `WALLogger.h:374-375`：
+
+```cpp
+// WALLogger.h:364-375
+struct LogBuffer {
+    static constexpr uint64_t max_buffer_size = 1024*1024*4;   // 4MB
+    char buffer[max_buffer_size];                              // 定长 4MB 日志区
+    uint64_t size = 0;                                         // 已写入字节
+    std::vector<uint64_t> txn_start_times;                     // 本 buffer 内各持久化事务的起点(用于回算延迟)
 };
-constexpr uint64_t max_log_buffer_queue_size = 128; // 每队列容量 128 个 buffer
-using LockfreeLogBufferQueue = LockfreeQueue<LogBuffer*, 128>; // SPSC 无锁队列
+static constexpr uint64_t max_log_buffer_queue_size = 128;
+using LockfreeLogBufferQueue = LockfreeQueue<LogBuffer *, 128>;
 ```
 
-### 8.4 从 logger 写入（worker 线程，无锁 SPSC）
+`LockfreeQueue`（`LockfreeQueue.h:24`）继承 **`boost::lockfree::spsc_queue<LogBuffer*, capacity<128>>`**——**单生产者单消费者（SPSC）** 无锁环形队列：
 
-`PashaGroupCommitLoggerSlave::write()`：
+| 端 | 谁 | 操作 |
+|----|----|------|
+| 生产者 (single producer) | 该 worker 的 `PashaGroupCommitLoggerSlave`（仅此一个 worker 线程写它） | `push(LogBuffer*)` |
+| 消费者 (single consumer) | 唯一的 master logger 线程 | `front()/pop()` |
 
-```cpp
-uint64_t cur_epoch = cxl_global_epoch->load();
-if ((cur_log_buffer->size + size > 4MB) || (cur_epoch > last_epoch)) {  // 缓冲满 或 epoch 翻转
-    if (cur_log_buffer->size > 0) {
-        log_buffer_queue.push(cur_log_buffer);     // 把整段 epoch buffer 推给 master
-        cur_log_buffer = new LogBuffer;
-    }
-    last_epoch = cur_epoch;
-}
-memcpy(&cur_log_buffer->buffer[cur_log_buffer->size], str, size);  // 仅 memcpy，无 fsync
-cur_log_buffer->size += size;
-if (persist) cur_log_buffer->txn_start_times.push_back(Time::now() - latency); // 记录 txn 起点
-return size;
-```
-
-> `sync()` 在 slave 中是 `CHECK(0)`（不直接 sync）；持久化完全交给 master。
-
-### 8.5 主 logger 线程（epoch 推进 + 落盘）
-
-`PashaGroupCommitLogger::start()`：
+`push`（`LockfreeQueue.h:29-36`）满时自旋让出：
 
 ```cpp
-while (!stopFlag.load()) {
-    if ((Time::now() - last_sync_time)/1000 >= group_commit_latency_us) { // 每 EPOCH_LEN
-        cxl_global_epoch->fetch_add(1);   // ★ 推进全局 epoch（所有 slave 下次 write 即翻转）
-        do_sync();                        // drain 所有队列并落盘
-        last_sync_time = Time::now();
-    }
-    std::this_thread::sleep_for(2us);     // 2µs 轮询
+void push(const T &value) {
+    while (base_type::write_available() == 0) std::this_thread::yield(); // 队列满(128)则等
+    bool ok = base_type::push(value); CHECK(ok);
 }
 ```
 
-`do_sync()`：遍历所有 `log_buffer_queues`，对每个非空 buffer：
+注意队列里传递的是 **`LogBuffer*` 裸指针**（4MB 堆对象的所有权随指针转移）：slave `new LogBuffer` → push；master `pop` 后 `delete log_buffer`（`:532`）。SPSC + 指针传递 = **零拷贝跨线程移交 4MB 日志**。
 
-```cpp
-file_writer.write(log_buffer->buffer, log_buffer->size);
-file_writer.sync();                       // ★ 真正 fsync（DirectFileWriter）
-// 统计：queuing_latency / disk_sync_latency / disk_sync_cnt / disk_sync_size
-committed_txn_cnt += log_buffer->txn_start_times.size();
-for (st in txn_start_times) txn_latency.add((Time::now()-st)/1000); // 回算端到端延迟
-delete log_buffer;
+### 9.4 装配：Coordinator 如何把三者连起来
+
+源码 `core/Coordinator.h:55-95, 208-211`：
+
+```
+log_path != "" && wal_group_commit_time != 0:
+├─ cxl_global_epoch (std::atomic<uint64_t>, 位于 CXL 共享内存)         (Coordinator.h:66-74)
+│   ├─ coordinator_id==0: cxlalloc_malloc + commit_shared_data_initialization
+│   └─ 其它 host:        wait_and_retrieve_cxl_shared_data 拿同一指针
+├─ for i in [0, worker_num):                                          (Coordinator.h:78-82)
+│     log_buffer_queues[i] = new LockfreeLogBufferQueue
+│     slave_loggers[i]     = new PashaGroupCommitLoggerSlave(log_buffer_queues[i], cxl_global_epoch)
+├─ master_logger = new PashaGroupCommitLogger(redo_filename, log_buffer_queues,
+│                    cxl_global_epoch, ioStopFlag, group_commit_batch_size,
+│                    wal_group_commit_time, emulated_persist_latency)  (Coordinator.h:83)
+└─ logger_threads[0] = std::thread(&PashaGroupCommitLogger::start, master_logger)  (Coordinator.h:210)
+   pin_thread_to_core(logger_threads[0])                              // 绑核，独占一个 CPU
 ```
 
-### 8.6 端到端持久化时序图
+绑定：每个 `TwoPLPashaExecutor` 在 `core/Executor.h:60-72` 取 `context.slave_loggers[id]` 作为自己的 `logger`，`txn.set_logger(logger)`；于是 **worker#i ↔ slave#i ↔ queue#i** 一一对应，master 持有全部 queue 的 vector。
+
+```mermaid
+flowchart LR
+    subgraph epoch["CXL 共享内存"]
+        E["cxl_global_epoch<br/>std::atomic uint64_t"]
+    end
+    W0["worker#0"] --> SL0["slave#0"] --> Q0["queue#0 (spsc,128)"]
+    W1["worker#1"] --> SL1["slave#1"] --> Q1["queue#1"]
+    Wn["worker#i"] --> SLn["slave#i"] --> Qn["queue#i"]
+    Q0 --> ML["master logger 线程"]
+    Q1 --> ML
+    Qn --> ML
+    ML -->|DirectFileWriter write+fdatasync| DISK[("*_group_commit.txt<br/>O_DIRECT")]
+    ML -.->|fetch_add 每 EPOCH_LEN| E
+    E -.->|load| SL0
+    E -.->|load| SL1
+    E -.->|load| SLn
+```
+
+### 9.5 入口：commit() 如何调用 logger->write
+
+承接 §3。commit 在两处调用 `logger->write`，二者都落到 **同一个 slave** 的 `cur_log_buffer`：
+
+| 写入点 | commit 源码 | 内容 | persist |
+|--------|-------------|------|---------|
+| Step1 redo（每条 write/insert/delete） | `TwoPLPasha.h:713/738/761` | `log_type,tableId,partitionId,epoch_version,key[,value]` | `false` |
+| Step3 commit record（非只读事务一次） | `TwoPLPasha.h:377` | `commit_tid << true` | `true` |
+
+```
+protocol.commit (TwoPLPasha.h:341)
+├─ write_redo_logs_for_commit (:691)
+│    └─ logger->write(redo_bytes, size, persist=false, txn.startTime)   // N 条
+└─ [非只读] logger->write(commit_record, size, persist=true, txn.startTime)  // :377
+        └─ PashaGroupCommitLoggerSlave::write (WALLogger.h:393)
+```
+
+`persist` 参数的作用：slave 仅在 `persist==true` 时把 `txn.startTime` 推进 `txn_start_times`（`:411-414`）——**只有写了 commit record 的事务才被计入“已提交并需统计延迟”**；只读事务（无 commit record）不计入 `committed_txn_cnt`。
+
+### 9.6 生产者：slave 写入 + epoch 翻转入队（逐行）
+
+`PashaGroupCommitLoggerSlave::write`（`WALLogger.h:393-417`，**verbatim**）：
+
+```cpp
+std::size_t write(const char *str, long size, bool persist,
+                  std::chrono::steady_clock::time_point txn_start_time, ...) override {
+    uint64_t cur_epoch = cxl_global_epoch->load();                       // :395 读全局 epoch
+    CHECK(cur_log_buffer != nullptr);
+    if (((cur_log_buffer->size + size) > LogBuffer::max_buffer_size)     // 缓冲将满 4MB
+            || (cur_epoch > last_epoch)) {                               // 或 epoch 翻转
+        if (cur_log_buffer->size > 0) {
+            log_buffer_queue.push(cur_log_buffer);                       // :401 整段移交 master
+            cur_log_buffer = new LogBuffer;                              // :402 换新 buffer
+        }
+        last_epoch = cur_epoch;                                          // :405 记下新 epoch
+    }
+    memcpy(&cur_log_buffer->buffer[cur_log_buffer->size], str, size);    // :408 仅 memcpy，无 syscall
+    cur_log_buffer->size += size;
+    if (persist == true) {                                              // :411 commit record 才记
+        auto latency = duration_cast<microseconds>(steady_clock::now() - txn_start_time).count();
+        cur_log_buffer->txn_start_times.push_back(Time::now() - latency); // 反推事务真实起点
+    }
+    return size;                                                        // 返回字节数(非 LSN)
+}
+```
+
+关键语义：
+- **一个 LogBuffer = 一个 epoch 内、该 worker 产生的全部日志**。push 的触发只有两种：① 缓冲满 4MB；② `cur_epoch > last_epoch`（master 推进了 epoch）。
+- slave 的 `write` **没有任何 syscall/fsync**，只是 memcpy + 偶尔 push 指针，因此对事务关键路径几乎零开销。
+- `sync()` 在 slave 中是 `CHECK(0)`（`:419-422`）——slave 永不自己同步。
+- **边界**：若某 worker 在一个 epoch 内无新写入，它上个 epoch 的 buffer 要等到 **下一次 write** 才会被 push（不是 epoch 一到就主动 push）。这意味着空闲 worker 的尾部日志可能延迟到下次活动才落盘——是该实现的已知特性。
+
+### 9.7 消费者：master start + do_sync drain（逐行）
+
+master 线程入口 `PashaGroupCommitLogger::start`（`WALLogger.h:464-475`，**verbatim**）：
+
+```cpp
+void start() {
+    LOG(INFO) << "logger thread started!";
+    while (stopFlag.load() == false) {
+        if ((Time::now() - last_sync_time) / 1000 >= group_commit_latency_us) {  // 每 EPOCH_LEN(us)
+            this->cxl_global_epoch->fetch_add(1);    // :469 ★ 推进全局 epoch (令所有 slave 下次翻转)
+            do_sync();                               // :470 drain 全部队列并落盘
+            last_sync_time = Time::now();
+        }
+        std::this_thread::sleep_for(std::chrono::microseconds(2));   // :473 2µs 轮询
+    }
+}
+```
+
+`do_sync`（`WALLogger.h:482-535`，**verbatim 精简**）：
+
+```cpp
+void do_sync() {
+    auto begin_time = steady_clock::now();        // 用于算排队时延
+    uint64_t flushed_log_buffer_num = 0;
+    for (auto i = 0; i < log_buffer_queues.size(); i++) {    // 遍历每个 worker 的队列
+        auto *cur_q = log_buffer_queues[i];
+        while (true) {
+            if (cur_q->empty()) break;                       // 该队列排空
+            LogBuffer *log_buffer = cur_q->front();          // :496 取队头
+            cur_q->pop();                                    // :500 释放槽位
+            // ---- 落盘 ----
+            auto sync_start = steady_clock::now();
+            file_writer.write(log_buffer->buffer, log_buffer->size);  // :504 DirectFileWriter O_DIRECT 写
+            file_writer.sync();                                       // :505 fdatasync
+            auto sync_end = steady_clock::now();
+            // ---- 统计 ----
+            queuing_latency.add(duration_us(sync_start - begin_time));   // :510 入队→开始落盘
+            disk_sync_latency.add(duration_us(sync_end - sync_start));   // :514 纯 fdatasync 耗时
+            disk_sync_cnt++; disk_sync_size += log_buffer->size;
+            committed_txn_cnt += log_buffer->txn_start_times.size();     // :519 累加已提交事务数
+            auto now = Time::now();
+            for (auto st : log_buffer->txn_start_times)
+                txn_latency.add((now - st) / 1000);                     // :521-524 端到端事务延迟
+            if (++flushed_log_buffer_num >= max_log_buffer_queue_size * log_buffer_queues.size())
+                begin_time = steady_clock::now();            // :528-530 VM 跨线程时钟漂移，周期刷新基准
+            delete log_buffer;                               // :532 释放 4MB
+        }
+    }
+}
+```
+
+要点：
+- master 的 `write()` 本体是 `CHECK(0)`（`:477-480`）——master **只通过 `do_sync` 落盘**，不接受直接 write。
+- **每个 LogBuffer 一次 `write+fdatasync`**：故 `disk_sync_cnt` ≈ 落盘的 buffer 数，`disk_sync_size` 为总字节。一个 epoch 通常对应 `worker_num` 个 buffer（每 worker 一个）。
+- `begin_time` 周期性重置是为规避 VM 中不同 vCPU 的 `steady_clock` 漂移导致排队时延算成负数/异常。
+
+### 9.8 端到端数据流图（redo → 磁盘）
+
+```mermaid
+flowchart TD
+    C["commit() Step1/Step3<br/>(TwoPLPasha.h:691/377)"] -->|"logger->write(bytes, size, persist)"| SW["slave::write (WALLogger.h:393)"]
+    SW -->|memcpy| BUF["cur_log_buffer: LogBuffer 4MB<br/>buffer[] + size + txn_start_times"]
+    SW -->|"cur_epoch 大于 last_epoch 或满4MB"| PUSH["log_buffer_queue.push(ptr)"]
+    PUSH --> Q["LockfreeLogBufferQueue<br/>boost spsc_queue cap=128"]
+    MasterEpoch["master::start 每EPOCH_LEN<br/>cxl_global_epoch.fetch_add(1)"] -.->|令 slave 翻转| SW
+    Q -->|"front()/pop()"| DS["master::do_sync (WALLogger.h:482)"]
+    DS -->|"file_writer.write()"| DFW["DirectFileWriter<br/>::write(roundUp(size,4096)) O_DIRECT"]
+    DFW -->|"file_writer.sync()"| FS["fdatasync(fd)"]
+    FS --> DISK[("*_group_commit.txt")]
+    DS -->|delete| FREE["free 4MB LogBuffer"]
+    DS --> STATS["queuing_latency / disk_sync_latency<br/>txn_latency / committed_txn_cnt"]
+```
+
+时序视角：
 
 ```mermaid
 sequenceDiagram
     autonumber
-    participant W as Worker (commit())
-    participant SL as Slave Logger (per-worker)
-    participant Q as LockfreeQueue
-    participant ML as Master Logger 线程
+    participant W as Worker commit()
+    participant SL as slave#i (PashaGroupCommitLoggerSlave)
+    participant Q as queue#i (spsc 128)
+    participant ML as master logger 线程
+    participant FW as DirectFileWriter
     participant D as Disk
 
-    Note over W: Step1 redo (persist=false)
-    W->>SL: write(redo, persist=false)
+    Note over W: Step1 redo (persist=false) x N
+    W->>SL: write(redo, false, startTime)
     SL->>SL: memcpy 进 cur_log_buffer
     Note over W: Step3 commit record (persist=true)
-    W->>SL: write(commit_tid+true, persist=true)
-    SL->>SL: memcpy + 记 txn_start_times
-    Note over W: commit() 立即返回 (异步持久化)
+    W->>SL: write(commit_tid+true, true, startTime)
+    SL->>SL: memcpy + txn_start_times.push_back
+    Note over W: commit() return true (异步, 不等落盘)
 
-    loop 每 EPOCH_LEN (group_commit_latency_us)
+    loop 每 EPOCH_LEN
         ML->>ML: cxl_global_epoch.fetch_add(1)
-        Note over SL: 下次 write 检测 cur_epoch 大于 last_epoch
-        SL->>Q: push(满 epoch 的 LogBuffer)
-        ML->>Q: pop()
-        ML->>D: write + fsync
-        ML->>ML: 统计 queuing / disk_sync / txn_latency
+        Note over SL: 下次 write 见 cur_epoch 大于 last_epoch
+        SL->>Q: push(cur_log_buffer); new LogBuffer
+        ML->>Q: front(); pop()
+        ML->>FW: write(buffer, size)
+        FW->>D: ::write O_DIRECT (roundUp 4096)
+        ML->>FW: sync()
+        FW->>D: fdatasync
+        ML->>ML: 统计 + delete LogBuffer
     end
 ```
 
-这正是 README 启动日志中三段统计的来源：
+### 9.9 统计三段（与 README 输出对应）
 
+`print_sync_stats`（`WALLogger.h:547-567`）输出三段，正是 README Hello-World 末尾的日志：
+
+| 日志段 | 字段 | 计算式（源码行） | 含义 |
+|--------|------|------------------|------|
+| `Group Commit Stats` | `txn_latency` + `committed_txn_cnt` | `txn_latency.add((now - txn_start)/1000)`（`:521-523`）；`committed_txn_cnt += txn_start_times.size()`（`:519`） | **端到端事务延迟**：从 `txn.startTime` 到日志落盘 |
+| `Queuing Stats` | `queuing_latency` | `add(sync_start - begin_time)`（`:509-510`） | buffer 在本轮 drain 中“轮到它落盘前”的排队时延 |
+| `Disk Sync Stats` | `disk_sync_latency` + `disk_sync_cnt` + `disk_sync_size` + `current global epoch` | `add(sync_end - sync_start)`（`:513-516`）；epoch=`cxl_global_epoch->load()` | 纯 `write+fdatasync` 物理 I/O 耗时与总量 |
+
+对照 README：
 ```
-WALLogger.h ... Group Commit Stats: ... committed_txn_cnt 620218   // txn_latency 端到端
-WALLogger.h ... Queuing Stats: ...                                 // queuing_latency 入队到落盘前等待
-WALLogger.h ... Disk Sync Stats: ... disk_sync_cnt 5098 ... current global epoch 2226  // fsync 本身
+WALLogger.h:539 Group Commit Stats: ... 47239 us (avg) committed_txn_cnt 620218
+WALLogger.h:545 Queuing Stats:      ... 25590 us (avg)
+WALLogger.h:550 Disk Sync Stats:    ... 2040 us (avg) disk_sync_cnt 5098 disk_sync_size 1543621646 current global epoch 2226
 ```
+可见：端到端延迟（~47ms）≫ 排队（~25ms）≫ 纯落盘（~2ms）——**绝大部分事务延迟花在等待本 epoch 凑批 + 排队**，而非磁盘本身，这正是 epoch group commit 用延迟换吞吐的体现。
+
+### 9.10 单机变体 GroupCommitLogger（对比）
+
+`GroupCommitLogger`（`:254-362`）是不依赖 CXL 的单机版，机制不同：
+- 构造时起一个 **detach 后台线程**（`:267-274`）每 2µs 检查 `waiting_syncs ≥ group_commit_txn_cnt` 或超时 → `do_sync()`。
+- `write`（`:281-296`）持 `mtx` 写入 `BufferedDirectFileWriter` 并推进 `write_lsn`；`persist` 时调 `sync(end_lsn)`。
+- `sync`（`:322-330`）**自旋等待** `sync_lsn ≥ lsn`，期间调 `on_blocking()` 回调（让事务线程在等待时处理远程消息）。
+- `do_sync`（`:298-320`）：满足批量/超时则 `writer.sync()`（fdatasync）并把 `sync_lsn` 推进到 `write_lsn`，记录 `sync_time/grouping_time/sync_batch_size/sync_batch_bytes`。
+
+| 维度 | `GroupCommitLogger`（单机） | `PashaGroupCommitLogger*`（Tigon/CXL） |
+|------|---------------------------|----------------------------------------|
+| 并发模型 | 全局 `mtx` 串行 write | 每 worker SPSC 队列，无锁 |
+| 批边界 | 计数阈值 OR 超时 | 全局 epoch（CXL 原子计数器） |
+| 事务等待 | `sync()` 自旋 `sync_lsn` | 不等待（异步，commit 直接返回） |
+| 落盘器 | `BufferedDirectFileWriter` | `DirectFileWriter` |
+| 跨主机 | 否 | 是（共享 `cxl_global_epoch`，各 host 独立 master 落盘本机日志） |
+
+### 9.11 关键不变量与边界条件
+
+1. **SPSC 安全**：每个 `LockfreeLogBufferQueue` 恰好一个 slave 写、一个 master 读，满足 boost spsc 前提；多 worker 不共享队列。
+2. **所有权移交**：`LogBuffer*` 经队列从 slave 转移到 master，master `delete`；slave push 后立即 `new` 新 buffer，无别名。
+3. **持久化原子性**：commit record（`commit_tid<<true`）与其 redo 在同一 epoch 的 buffer 内，按写入顺序连续落盘；恢复时配合 `epoch_version`（§7.2）按 epoch 切一致点——**只重放“commit record 已落盘”的事务**。
+4. **O_DIRECT 对齐**：`DirectFileWriter::write` 用 `roundUp(size, 4096)`，落盘字节为块对齐（故 `disk_sync_size` 含填充）。
+5. **master 单线程**：所有 host-local 队列由唯一 master 线程顺序 drain，落盘到单文件，天然串行、无写写竞争。
+6. **异步提交语义**：worker 写完 commit record 即返回成功（§3 return true）；真正持久化在之后的某个 epoch 完成——若崩溃发生在落盘前，该事务按未提交处理（其 redo 无对应已落盘 commit record）。
 
 ---
 
@@ -683,7 +886,17 @@ abort 不写 commit record，redo buffer 中已写的 redo 记录因没有对应
 | 执行期取锁 | `TwoPLPashaExecutor.h:81-160, 220-340` |
 | 计时桶定义 | `TwoPLPashaTransaction.h:46-135` |
 | 计时聚合打印 | `core/Executor.h:229-260` |
-| WAL 全部 logger | `common/WALLogger.h` |
+| WAL 全部 logger | `common/WALLogger.h`（744 行） |
+| WALLogger 抽象基类 | `WALLogger.h:194-221` |
+| DirectFileWriter (O_DIRECT) | `WALLogger.h:26-73` |
+| BufferedDirectFileWriter | `WALLogger.h:75-192`（4MB `:184`） |
+| LogBuffer 结构 (4MB) | `WALLogger.h:364-372` |
+| LockfreeLogBufferQueue | `WALLogger.h:374-375`；`common/LockfreeQueue.h:24-55`（boost spsc, cap 128） |
+| slave write + epoch 翻转入队 | `WALLogger.h:393-417` |
+| master start (推进 epoch) | `WALLogger.h:464-475` |
+| master do_sync (drain+落盘) | `WALLogger.h:482-535` |
+| WAL 统计打印三段 | `WALLogger.h:547-567` |
+| GroupCommitLogger (单机) | `WALLogger.h:254-362` |
 | logger 装配 + 主线程启动 | `core/Coordinator.h:55-95, 208-211` |
 | epoch 协调 (GC 系) | `core/group_commit/Manager.h:23-76` |
 | ExecutorStatus | `core/Defs.h` |
