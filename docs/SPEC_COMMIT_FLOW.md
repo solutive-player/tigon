@@ -112,16 +112,16 @@ flowchart TD
     A["commit(txn, messages)"] --> B{txn.abort_lock?}
     B -->|是| AB["abort(txn) → return false"]
     B -->|否| C["cur_global_epoch = logger->get_global_epoch()"]
-    C --> D["Step1: write_redo_logs_for_commit\n(prepare 阶段, 记录 redo)"]
+    C --> D["Step1: write_redo_logs_for_commit<br/>(prepare 阶段, 记录 redo)"]
     D --> E["Step2: commit_tid = generate_tid(txn)"]
     E --> F{有写/插/删?}
-    F -->|是| G["Step3: 写 commit record\nlogger->write(commit_tid+true, persist=true)"]
+    F -->|是| G["Step3: 写 commit record<br/>logger.write(commit_tid+true, persist=true)"]
     F -->|只读| H[跳过 commit record]
     G --> I
-    H --> I["Step4: 应用 insert/delete\n(phantom detection 分支)"]
-    I --> J["sync_messages(txn)\n等远程占位插入完成"]
-    J --> K["Step5: write_and_replicate\n(把新值写回行)"]
-    K --> L["Step6: release_lock\n(2PL 收缩阶段, 释放全部锁)"]
+    H --> I["Step4: 应用 insert/delete<br/>(phantom detection 分支)"]
+    I --> J["sync_messages(txn)<br/>等远程占位插入完成"]
+    J --> K["Step5: write_and_replicate<br/>(把新值写回行)"]
+    K --> L["Step6: release_lock<br/>(2PL 收缩阶段, 释放全部锁)"]
     L --> M["release_migrated_rows(txn)"]
     M --> N{when_to_move_out==Reactive?}
     N -->|是| O["发送 data_move_out_hint 消息"]
@@ -636,7 +636,7 @@ stateDiagram-v2
     WAIT_START --> EXECUTING: status==START
     EXECUTING --> EXECUTING: execute+commit/abort 循环
     EXECUTING --> DRAINING: status==STOP
-    DRAINING --> CLEANUP: 等待 status==CLEANUP\n期间 process_request()
+    DRAINING --> CLEANUP: 等待 status==CLEANUP (期间 process_request)
     CLEANUP --> WAIT_START: n_complete_workers++ (第二次)
     WAIT_START --> [*]: status==EXIT
 ```
