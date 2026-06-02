@@ -58,7 +58,7 @@ flowchart TB
     W1 --> S1 --> Q1 --> ML
     Wn --> Sn --> Qn --> ML
     ML -->|write+fsync| DISK
-    ML -.->|fetch_add(1) 每 EPOCH_LEN| EPOCH
+    ML -.->|"fetch_add(1) 每 EPOCH_LEN"| EPOCH
     EPOCH -.->|load| S0
     EPOCH -.->|load| S1
     EPOCH -.->|load| Sn
