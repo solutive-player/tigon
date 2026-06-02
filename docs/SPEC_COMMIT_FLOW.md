@@ -38,28 +38,30 @@ Tigon 的每个主机（host）= 一个 VM，进程内有若干 **transaction wo
 flowchart TB
     subgraph Host["一台主机 (VM)"]
         direction TB
-        W0["Executor#0\nTwoPLPashaExecutor"]
+        W0["Executor#0<br/>TwoPLPashaExecutor"]
         W1["Executor#1"]
         Wn["Executor#N"]
         subgraph SL["从 logger (每 worker 一个)"]
-            S0["PashaGroupCommitLoggerSlave#0\n(LogBuffer 4MB)"]
+            S0["PashaGroupCommitLoggerSlave#0<br/>(LogBuffer 4MB)"]
             S1["Slave#1"]
             Sn["Slave#N"]
         end
-        Q0["LockfreeLogBufferQueue#0\n(cap=128 buffers)"]
+        Q0["LockfreeLogBufferQueue#0<br/>(cap=128 buffers)"]
         Q1["Queue#1"]
         Qn["Queue#N"]
-        ML["PashaGroupCommitLogger (主)\nDirectFileWriter + fsync"]
-        DISK[("redo log on disk\n*_group_commit.txt")]
+        ML["PashaGroupCommitLogger (主)<br/>DirectFileWriter + fsync"]
+        DISK[("redo log on disk<br/>*_group_commit.txt")]
     end
-    EPOCH["cxl_global_epoch\n(std::atomic<uint64_t>, 位于 CXL 共享内存)"]
+    EPOCH["cxl_global_epoch<br/>(std::atomic uint64_t, 位于 CXL 共享内存)"]
 
     W0 -->|write redo| S0 -->|epoch 翻转/缓冲满 push| Q0 --> ML
     W1 --> S1 --> Q1 --> ML
     Wn --> Sn --> Qn --> ML
     ML -->|write+fsync| DISK
     ML -.->|fetch_add(1) 每 EPOCH_LEN| EPOCH
-    EPOCH -.->|load| S0 & S1 & Sn
+    EPOCH -.->|load| S0
+    EPOCH -.->|load| S1
+    EPOCH -.->|load| Sn
 ```
 
 **关键点**：worker 在 `commit()` 中调用 `logger->write(...)` 只是把日志拷进当前 epoch 的 buffer；真正的 fsync 由主 logger 线程在 epoch 翻转时完成（**epoch-based group commit**）。提交对 worker 而言是**异步持久化**——它写完 redo 与 commit record 后即可释放锁返回，事务延迟由日志线程统计回填。
@@ -595,7 +597,7 @@ sequenceDiagram
 
     loop 每 EPOCH_LEN (group_commit_latency_us)
         ML->>ML: cxl_global_epoch.fetch_add(1)
-        Note over SL: 下次 write 检测 cur_epoch>last_epoch
+        Note over SL: 下次 write 检测 cur_epoch 大于 last_epoch
         SL->>Q: push(满 epoch 的 LogBuffer)
         ML->>Q: pop()
         ML->>D: write + fsync
