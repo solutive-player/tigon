@@ -111,7 +111,7 @@ core::Executor::start()                         core/Executor.h:77
 flowchart TD
     A["commit(txn, messages)"] --> B{txn.abort_lock?}
     B -->|是| AB["abort(txn) → return false"]
-    B -->|否| C["cur_global_epoch = logger->get_global_epoch()"]
+    B -->|否| C["cur_global_epoch = logger.get_global_epoch()"]
     C --> D["Step1: write_redo_logs_for_commit<br/>(prepare 阶段, 记录 redo)"]
     D --> E["Step2: commit_tid = generate_tid(txn)"]
     E --> F{有写/插/删?}
@@ -415,17 +415,17 @@ protocol.commit (TwoPLPasha.h:341)
 ```mermaid
 sequenceDiagram
     autonumber
-    participant Row as 行版本字 (lmeta/scc_data->tid)
+    participant Row as 行版本字 (lmeta.tid / scc_data.tid)
     participant Ex as execute (取锁)
     participant Cm as commit()
     participant Log as redo LogBuffer
 
-    Ex->>Row: old=lmeta->tid; tid=remove_lock_bit(old); 置写锁位
+    Ex->>Row: old=lmeta.tid; tid=remove_lock_bit(old); 置写锁位
     Ex-->>Cm: RWKey.tid = tid (纯版本)
     Note over Cm: Step2 generate_tid = max(readSet.tid)+1
     Cm->>Cm: ev = generate_epoch_version(writeKey.tid, cur_global_epoch)
     Cm->>Log: write(log_type,table,part,ev,key,value)  (Step1)
-    Cm->>Row: write_lock_release(meta,size,ev) → tid=ev (Step6)
+    Cm->>Row: write_lock_release(meta,size,ev) 令 tid=ev (Step6)
     Note over Row: 下一个读者 remove_lock_bit 得到新 ev,<br/>高位 epoch 已推进
 ```
 
@@ -727,7 +727,7 @@ void do_sync() {
 
 ```mermaid
 flowchart TD
-    C["commit() Step1/Step3<br/>(TwoPLPasha.h:691/377)"] -->|"logger->write(bytes, size, persist)"| SW["slave::write (WALLogger.h:393)"]
+    C["commit() Step1/Step3<br/>(TwoPLPasha.h:691/377)"] -->|"logger.write(bytes, size, persist)"| SW["slave::write (WALLogger.h:393)"]
     SW -->|memcpy| BUF["cur_log_buffer: LogBuffer 4MB<br/>buffer[] + size + txn_start_times"]
     SW -->|"cur_epoch 大于 last_epoch 或满4MB"| PUSH["log_buffer_queue.push(ptr)"]
     PUSH --> Q["LockfreeLogBufferQueue<br/>boost spsc_queue cap=128"]
@@ -923,8 +923,8 @@ handler 类型签名见 `TwoPLPashaTransaction.h:534/536/538`。
 ```mermaid
 flowchart TD
     S["scanRequestHandler(table, min_key, max_key, limit, type, ...)"] --> B{"local? (has_master_partition)"}
-    B -->|本地| L["table->scan(min_key, local_scan_processor)"]
-    B -->|远程CXL| R["target_cxl_table->scan(min_key, remote_scan_processor)"]
+    B -->|本地| L["table.scan(min_key, local_scan_processor)"]
+    B -->|远程CXL| R["target_cxl_table.scan(min_key, remote_scan_processor)"]
 
     L --> LP["对每个 key:<br/>判定 locking_next_tuple"]
     LP --> LL{"is_last / 达 limit / key 大于 max_key ?"}
@@ -933,7 +933,7 @@ flowchart TD
     LL -->|是, next tuple| LN["按 type 加锁 → next_row_entity = cur_row; 停"]
     LK -->|加锁失败| LF["scan_success=false → abort_lock"]
 
-    R --> RC["smeta->get_next_key_real_bit / get_prev_key_real_bit"]
+    R --> RC["smeta.get_next_key_real_bit / get_prev_key_real_bit"]
     RC --> RM{"real-bit 缺失?"}
     RM -->|是| RMig["migration_required=true<br/>发 new_data_migration_message_for_scan<br/>释放锁 + scan_results.clear()"]
     RM -->|否| RK["remote_read/write_lock_and_inc_ref_cnt"]
