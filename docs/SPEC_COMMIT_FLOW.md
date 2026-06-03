@@ -99,7 +99,7 @@ core::Executor::start()                         core/Executor.h:77
 - `ABORT_NORETRY`：逻辑错误，调用 `protocol.abort()`，不重试；
 - `ABORT`：冲突中止，`protocol.abort()` 后复位种子重试。
 
-> 注：`core/group_commit/Executor.h` 是另一套（Silo 系 GC 协议用）双消息通道 + 提交队列 `q` 的执行器；**TwoPLPasha 走的是 `core::Executor`**（见 `protocol/TwoPLPasha/TwoPLPashaExecutor.h:20` 的继承关系）。两者主循环结构高度一致，差异见 §10。
+> 注：`core/group_commit/Executor.h` 是另一套（Silo 系 GC 协议用）双消息通道 + 提交队列 `q` 的执行器；**TwoPLPasha 走的是 `core::Executor`**（见 `protocol/TwoPLPasha/TwoPLPashaExecutor.h:20` 的继承关系）。两者主循环结构高度一致，差异见 §11。
 
 ---
 
@@ -818,7 +818,209 @@ WALLogger.h:550 Disk Sync Stats:    ... 2040 us (avg) disk_sync_cnt 5098 disk_sy
 
 ---
 
-## 10. `core::Executor` vs `core/group_commit::Executor`
+## 10. Phantom Detection（next-key locking 幻读避免）
+
+Tigon 用 **next-key locking（下一键锁）** 在 2PL 之上避免 **幻读（phantom）**。本节给出问题、数据结构、执行期加锁、commit/abort 分支与 CXL 专属的 real-bit 机制，全部以源码为依据，符号名沿用源码。
+
+### 10.1 问题：纯 2PL 为何挡不住幻读
+
+纯 2PL 只锁“已存在的行”，无法阻止并发事务往 **范围空隙里插入新键**（或删除边界键），导致同一事务二次 `scan` 结果不同 → 破坏可串行化。
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant T1 as 事务 T1 (scan [10,20])
+    participant IDX as B+Tree 索引
+    participant T2 as 事务 T2 (insert key=15)
+    T1->>IDX: scan(10,20) 返回 {12, 18}
+    T2->>IDX: insert(15)  (空隙里, T1 未锁 15)
+    T2-->>T2: commit
+    T1->>IDX: 再次 scan(10,20) 返回 {12, 15, 18}
+    Note over T1: 出现幻影行 15 → 不可串行化
+```
+
+**解决（next-key locking）**：`scan` 不仅锁范围内的键，还锁 **紧邻右边界的“下一个键”（next tuple）**；任何 `insert` 必须先锁其插入位置的 next key，若该锁被 scanner 持有，则 insert 失败/中止——空隙被“下一键锁”守住，幻影无法产生。
+
+```mermaid
+flowchart LR
+    subgraph 索引键序
+      K12["12 (范围内, 锁)"] --> K18["18 (范围内, 锁)"] --> K22["22 = next tuple (锁!)"]
+    end
+    INS["T2 insert 15 / 20<br/>需锁其 next key (18 或 22)"] -.->|"被 scanner 持锁 → 失败"| K18
+    INS -.-> K22
+```
+
+### 10.2 开关与协议变体
+
+| 项 | 源码 | 说明 |
+|----|------|------|
+| `enable_phantom_detection` 默认 | `core/Context.h:117`（`= true`） | 完整 Tigon 默认开启 |
+| 命令行 flag | `core/Macros.h:84`（`DEFINE_bool(..., "next-key locking")`） | `--enable_phantom_detection` |
+| 变体 `TwoPLPashaPhantom` | `scripts/run.sh:213/224, 393/404`（`--enable_phantom_detection=false`） | README 称 "Tigon with phantom avoidance disabled" 基线 |
+| `TwoPLPasha.h` 内分叉 | `:69`(abort) `:383`(commit ins/del) `:646`(write-back) `:817`(release_lock) `:992` | 5 处 `if (enable_phantom_detection == true)` |
+
+### 10.3 数据结构（符号沿用源码）
+
+```mermaid
+classDiagram
+    class TwoPLPashaTransaction {
+        +scanSet
+        +insertSet
+        +deleteSet
+        +scanRequestHandler
+        +insertRequestHandler
+        +deleteRequestHandler
+    }
+    class TwoPLPashaRWKey {
+        +min_key
+        +max_key
+        +limit
+        +scan_results
+        +int type
+        +next_row_entity
+        +is_next_row_locked
+        +require_lock_next_row
+    }
+    class TwoPLPashaMetadataShared {
+        +is_next_key_real_bit_index_39
+        +is_prev_key_real_bit_index_38
+    }
+    TwoPLPashaTransaction *-- TwoPLPashaRWKey : scanSet/insertSet/deleteSet
+    TwoPLPashaRWKey ..> TwoPLPashaMetadataShared : 远程行经 CXL 检查 real-bit
+```
+
+| 结构 | 位置 | 作用 |
+|------|------|------|
+| `scanSet` / `insertSet` / `deleteSet` | `TwoPLPashaTransaction.h:185-187`（clear）；push `:505/511/517` | 范围查询 / 插入 / 删除 三类请求集 |
+| `enum { SCAN_FOR_READ, SCAN_FOR_UPDATE, SCAN_FOR_INSERT, SCAN_FOR_DELETE }` | `TwoPLPashaRWKey.h:21` | scan 意图，决定加读锁/写锁 |
+| scan 参数 `min_key/max_key/limit/scan_results/type` | `RWKey.h:211-244`（`set_scan_args`/`get_scan_*`） | 范围与结果容器 |
+| next-tuple：`next_row_entity` / `is_next_row_locked` / `require_lock_next_row` | `RWKey.h:247-275, 362-364` | next-key locking 目标行与状态位 |
+| `ITable::row_entity` | `core/Table.h` | `(key, key_size, meta, data, value_size)` 五元组 |
+| real-bit：`is_next_key_real_bit_index=39` / `is_prev_key_real_bit_index=38` | `TwoPLPashaHelper.h:299-300`；getter/setter `:153-180` | 迁移行对“前驱/后继键”的认知是否等于权威索引 |
+
+### 10.4 事务 API → 执行期分派
+
+应用层调用 `scan_for_read/update/insert/delete`（`TwoPLPashaTransaction.h:263-318`）、`insert_row`（`:324`）填充集合。`execute()` 的处理循环（`TwoPLPashaTransaction.h:394-460`）**倒序**遍历三集合并调用 handler：
+
+```
+transaction->execute(id)                               (core/Executor.h:132)
+└─ process 循环 (TwoPLPashaTransaction.h:394-460)
+   ├─ scanSet[i]  → scanRequestHandler(...)            (:404)
+   │     success → set_next_row_entity + set_next_row_locked (:414-415)
+   │     fail    → abort_lock = true                   (:409)
+   │     migration_required → 不处理, 待迁移后整事务重试 (:416)
+   ├─ insertSet[i]→ insertRequestHandler(...)          (:431)
+   │     fail → abort_insert = true                    (:434)
+   │     require_lock_next_row → set_next_row_*        (:438-440)
+   └─ deleteSet[i]→ deleteRequestHandler(...)          (:453)
+         fail → abort_delete = true                    (:455)
+```
+
+handler 类型签名见 `TwoPLPashaTransaction.h:534/536/538`。
+
+### 10.5 scanRequestHandler：next-key 加锁核心（`Executor.h:177-395`）
+
+```mermaid
+flowchart TD
+    S["scanRequestHandler(table, min_key, max_key, limit, type, ...)"] --> B{"local? (has_master_partition)"}
+    B -->|本地| L["table->scan(min_key, local_scan_processor)"]
+    B -->|远程CXL| R["target_cxl_table->scan(min_key, remote_scan_processor)"]
+
+    L --> LP["对每个 key:<br/>判定 locking_next_tuple"]
+    LP --> LL{"is_last / 达 limit / key 大于 max_key ?"}
+    LL -->|否, 范围内| LK["按 type 加锁<br/>read_lock / write_lock"]
+    LK --> LPush["scan_results.push_back(cur_row)"]
+    LL -->|是, next tuple| LN["按 type 加锁 → next_row_entity = cur_row; 停"]
+    LK -->|加锁失败| LF["scan_success=false → abort_lock"]
+
+    R --> RC["smeta->get_next_key_real_bit / get_prev_key_real_bit"]
+    RC --> RM{"real-bit 缺失?"}
+    RM -->|是| RMig["migration_required=true<br/>发 new_data_migration_message_for_scan<br/>释放锁 + scan_results.clear()"]
+    RM -->|否| RK["remote_read/write_lock_and_inc_ref_cnt"]
+    RK --> RPush["push 结果 / 存 next_row_entity"]
+```
+
+**本地分区**（`:189-261`）`local_scan_processor`：
+- 判定 `locking_next_tuple`：`is_last_tuple` 或 达到 `limit` 或 `compare_key(key, max_key) > 0`（`:199-205`）——**第一个越过右边界的键即 next tuple**。
+- 按 type 加锁：`read_lock`(READ) / `write_lock`(UPDATE/INSERT/DELETE)（`:227-237`）。
+- 非 next-tuple → `scan_results.push_back(cur_row)` 继续（`:242-245`）；是 next-tuple → 存 `next_row_entity` 并停（`:246-251`）。
+- 加锁失败 → `scan_success=false` 立即停（`:252-256`）。
+
+**远程/CXL 分区**（`:262-394`）`remote_scan_processor`：
+- 先查 `smeta->get_next_key_real_bit()/get_prev_key_real_bit()`，按位置（首键/末键/中间键）决定 `migration_required`（`:289-311`）。
+- real → `remote_read/write_lock_and_inc_ref_cnt`（`:325-332`）。
+- 需迁移 → 发 `new_data_migration_message_for_scan`、释放已得锁、`scan_results.clear()`（`:366-392`），迁移后整事务重试。
+
+| scan type | 本地加锁 | 远程加锁 | commit 行为 |
+|-----------|----------|----------|-------------|
+| `SCAN_FOR_READ` | `read_lock` | `remote_read_lock_and_inc_ref_cnt` | 只读，无写回 |
+| `SCAN_FOR_UPDATE` | `write_lock` | `remote_write_lock_*` | write-back（`:646-678`） |
+| `SCAN_FOR_INSERT` | `write_lock` | `remote_write_lock_*` | 锁住 next key 防插入幻影 |
+| `SCAN_FOR_DELETE` | `write_lock` | `remote_write_lock_*` | commit 删除（`:447-480`） |
+
+### 10.6 insertRequestHandler + insert_and_update_next_key_info
+
+```
+insertRequestHandler (Executor.h:397-421)
+├─ 本地: insert_and_update_next_key_info(table, key, value, require_lock_next_key, next_row_entity)  (:409)
+│    └─ table->insert_and_process_adjacent_tuples(key, value, adjacent_tuples_processor, true)  (Helper.h:1899)
+│         └─ adjacent_tuples_processor (Helper.h:1822-1896):
+│              ├─ require_lock_next_key → write_lock(next_meta) 锁 next key  (:1836)
+│              │     成功 → next_row_entity = next_row
+│              ├─ prev 邻居已迁移 → prev_smeta->clear_next_key_real_bit()   (:1848/1876)
+│              └─ next 邻居已迁移 → next_smeta->clear_prev_key_real_bit()   (:1861/1889)
+└─ 远程: 推迟到 commit 阶段发送 (return true)  (:416-419)
+```
+
+要点：插入占位行后，因索引拓扑变化，**已迁移的前驱/后继邻居缓存的邻接关系失效**，必须清其 `next_key_real_bit`/`prev_key_real_bit`（`Helper.h:1848/1861/1876/1889`）。远程 insert 不在执行期做，推迟到 commit 以避免回滚复杂度。
+
+### 10.7 deleteRequestHandler（`Executor.h:423-444`）
+
+phantom 分支假设所有删除是 **"read and delete"**：写锁在读阶段已取，执行期 **不做实际删除**（仅占位），真正移除推迟到 commit。对比：非 phantom 分支（`:521-559`）在 handler 内直接 `search`+`write_lock`+标记，找不到行即 `abort_delete=true`。
+
+### 10.8 commit 阶段的 phantom 分支（`TwoPLPasha.h:383-521`）
+
+```mermaid
+flowchart TD
+    C["commit() phantom 分支 (:383)"] --> I["commit inserts (:386-441)"]
+    I --> IL["本地: search_and_update_next_key_info 更新前驱/后继 real-bit<br/>+ modify_tuple_valid_bit(meta,true,true) 占位转正 (:428-434)"]
+    I --> IR["远程: new_remote_insert_message (:437)"]
+    I --> SY["sync_messages(txn) 等远程占位+迁移 (:445)"]
+    SY --> D["commit deletes: scanSet 中 SCAN_FOR_DELETE (:447-480)"]
+    D --> DL["本地: delete_specific_row_and_move_out (:468)"]
+    D --> DR["远程: remote_modify_tuple_valid_bit(false) + new_remote_delete_message (:475-477)"]
+    D --> WB["write-back: scanSet SCAN_FOR_UPDATE 应用 update/remote_update (:646-678)"]
+```
+
+### 10.9 release_lock / abort 的 phantom 分支
+
+| 路径 | 源码 | 动作 |
+|------|------|------|
+| `release_lock` | `:817-841` | 释放 insertSet 的 next-row 写锁 |
+| `release_lock` | `:843+` | 按 `SCAN_FOR_*` 释放 scanSet 范围锁 + next-row 锁 |
+| `abort` 回滚 insert | `:84-94` | `table->remove(placeholder)` + 释放 next-row 写锁 |
+| `abort` 回滚 delete | `:257+` | 仅释放写锁（行未真正删） |
+| `abort` 释放 read/scan 锁 | `:107-256` | 与 release_lock 对称 |
+
+### 10.10 real-bit 的 CXL 语义（关键创新）
+
+迁移到 CXL 的行用 `next_key_real_bit`(bit 39) / `prev_key_real_bit`(bit 38) 标记“它对相邻键的认知是否等于权威（master 本地 B+Tree）索引”：
+
+```mermaid
+flowchart LR
+    INS["本地 insert/delete 改变邻接"] -->|"clear_*_key_real_bit"| NB["邻居 smeta real-bit = false"]
+    RS["远程 scanner remote_scan_processor"] -->|"get_*_key_real_bit() == false"| MIG["migration_required<br/>拉取权威状态后重试"]
+    NB --> RS
+```
+
+- 写者（insert/delete）改变邻接关系时 **清掉邻居的对应 real-bit**（`Helper.h:1848/1861` 等）。
+- 远程 scanner 看到 `real-bit == false` 必须先 **数据迁移**（`new_data_migration_message_for_scan`）拉取权威邻接，才能安全做 next-key locking（`Executor.h:289-311, 366-372`）。
+
+这是经典 next-key locking 在 **CXL 共享内存 + 数据迁移** 下的扩展：本地行的邻接由 master 的 B+Tree 直接保证，迁移行则靠 real-bit 表达“缓存邻接是否可信”。
+
+---
+
+## 11. `core::Executor` vs `core/group_commit::Executor`
 
 Tigon(TwoPLPasha) 使用 `core::Executor`；Silo-GC 系协议使用 `group_commit::Executor`。两者提交驱动对比：
 
@@ -848,7 +1050,7 @@ stateDiagram-v2
 
 ---
 
-## 11. 中止（Abort）路径
+## 12. 中止（Abort）路径
 
 `commit()` 第 0 步若 `txn.abort_lock` 为真，转 `abort()`（`TwoPLPasha.h:67-339`）。`abort()` 与 `release_lock` 对称地释放所有已持有锁，并回滚 insert/delete：
 
@@ -865,7 +1067,7 @@ abort 不写 commit record，redo buffer 中已写的 redo 记录因没有对应
 
 ---
 
-## 12. 关键代码引用索引
+## 13. 关键代码引用索引
 
 | 功能 | 文件:行 |
 |------|---------|
@@ -877,6 +1079,16 @@ abort 不写 commit record，redo buffer 中已写的 redo 记录因没有对应
 | generate_epoch_version | `TwoPLPasha.h:681-689` |
 | write_redo_logs_for_commit | `TwoPLPasha.h:691-763` |
 | release_lock | `TwoPLPasha.h:765+` |
+| phantom 开关 | `core/Context.h:117`；`core/Macros.h:84`；变体 `scripts/run.sh:213/224` |
+| scanSet/insertSet/deleteSet | `TwoPLPashaTransaction.h:185-187`；push `:505/511/517` |
+| scan/insert/delete API | `TwoPLPashaTransaction.h:263-324` |
+| 执行期分派循环 | `TwoPLPashaTransaction.h:394-460` |
+| SCAN_FOR_* 枚举 + next-tuple 字段 | `TwoPLPashaRWKey.h:21`；`:247-275, 362-364` |
+| scanRequestHandler | `TwoPLPashaExecutor.h:177-395`（远程 real-bit 检查 `:289-311`） |
+| insertRequestHandler | `TwoPLPashaExecutor.h:397-421` |
+| insert_and_update_next_key_info | `TwoPLPashaHelper.h:1820-1900` |
+| real-bit 索引/读写 | `TwoPLPashaHelper.h:299-300`；`:153-180` |
+| commit/abort phantom 分支 | `TwoPLPasha.h:383-521`（abort `:69-256`，release `:817+`） |
 | TID/锁位布局常量 | `TwoPLPashaHelper.h:2021-2028`；共享行 `:279-292` |
 | remove_lock_bit | `TwoPLPashaHelper.h:1158-1171` |
 | take_read/write_lock_and_read | `TwoPLPashaHelper.h:526 / 793` |
@@ -903,6 +1115,6 @@ abort 不写 commit record，redo buffer 中已写的 redo 记录因没有对应
 
 ---
 
-## 13. 一句话总结
+## 14. 一句话总结
 
 > Tigon 的提交是 **“2PL 锁已就绪 → 写 redo（异步缓冲）→ 生成单调 TID → 写 commit record → 应用 insert/delete → 写回新值 → 按 epoch_version 放锁”** 的同步流水线；而**持久化是异步的**：worker 只把日志 memcpy 进 per-worker 的 epoch LogBuffer，由唯一的 master logger 线程在每个 `EPOCH_LEN` 推进 `cxl_global_epoch` 并把各 worker 当前 epoch 的 buffer 统一 `write+fsync` 落盘，从而以 **epoch-based group commit** 摊薄 fsync 开销，并通过 `epoch_version = (epoch<<32 | seq)` 实现按 epoch 的崩溃一致恢复。
