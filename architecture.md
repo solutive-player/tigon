@@ -514,7 +514,7 @@ sequenceDiagram
     A->>B: DATA_MIGRATION_REQUEST (key, txn_id, key_offset), pendingResponses++
     B->>B: data_migration_request_handler → migration_manager.move_row_in(table,key,row)
     B-->>A: DATA_MIGRATION_RESPONSE (success, key_offset)
-    A->>A: get_migrated_row() → hit; remote_take_read_lock_and_read()
+    A->>A: get_migrated_row() → hit, 然后 remote_take_read_lock_and_read()
     Note over A: smeta.lock + SCC prepare_read + ref_cnt++ + memcpy
 ```
 
@@ -862,7 +862,7 @@ classDiagram
 ```mermaid
 flowchart TB
     C["Coordinator ctor (GROUP_WAL 分支)"] --> EP["host0: cxlalloc_malloc(global_epoch)+commit<br/>其余 host: wait_and_retrieve (:66-73)"]
-    C --> Q["new vector&lt;LockfreeLogBufferQueue*&gt;"]
+    C --> Q["new vector(LockfreeLogBufferQueue*)"]
     Q --> SL["每 worker: new LockfreeLogBufferQueue (:79)<br/>+ new PashaGroupCommitLoggerSlave(queue, global_epoch) → context.slave_loggers (:81)"]
     Q --> MA["new PashaGroupCommitLogger(file, queues, global_epoch, ioStopFlag, ...) (:83)"]
     MA --> ST["Coordinator::start 起 master 线程 PashaGroupCommitLogger::start + pin_thread_to_core (:208-211)"]
