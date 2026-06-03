@@ -420,7 +420,7 @@ sequenceDiagram
     participant Cm as commit()
     participant Log as redo LogBuffer
 
-    Ex->>Row: old=lmeta.tid; tid=remove_lock_bit(old); 置写锁位
+    Ex->>Row: old=lmeta.tid, tid=remove_lock_bit(old), 置写锁位
     Ex-->>Cm: RWKey.tid = tid (纯版本)
     Note over Cm: Step2 generate_tid = max(readSet.tid)+1
     Cm->>Cm: ev = generate_epoch_version(writeKey.tid, cur_global_epoch)
@@ -763,8 +763,8 @@ sequenceDiagram
     loop 每 EPOCH_LEN
         ML->>ML: cxl_global_epoch.fetch_add(1)
         Note over SL: 下次 write 见 cur_epoch 大于 last_epoch
-        SL->>Q: push(cur_log_buffer); new LogBuffer
-        ML->>Q: front(); pop()
+        SL->>Q: push(cur_log_buffer), 换新 LogBuffer
+        ML->>Q: front(), pop()
         ML->>FW: write(buffer, size)
         FW->>D: ::write O_DIRECT (roundUp 4096)
         ML->>FW: sync()
@@ -930,7 +930,7 @@ flowchart TD
     LP --> LL{"is_last / 达 limit / key 大于 max_key ?"}
     LL -->|否, 范围内| LK["按 type 加锁<br/>read_lock / write_lock"]
     LK --> LPush["scan_results.push_back(cur_row)"]
-    LL -->|是, next tuple| LN["按 type 加锁 → next_row_entity = cur_row; 停"]
+    LL -->|是, next tuple| LN["按 type 加锁 → next_row_entity = cur_row, 停"]
     LK -->|加锁失败| LF["scan_success=false → abort_lock"]
 
     R --> RC["smeta.get_next_key_real_bit / get_prev_key_real_bit"]
