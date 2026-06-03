@@ -79,7 +79,7 @@ flowchart TB
         DB1[("本地 DRAM: Database")]
     end
 
-    E0 <-->|"LockfreeQueue<Message*>"| OD0
+    E0 <-->|"LockfreeQueue(Message*)"| OD0
     ID0 -->|"push_message"| E0
     OD0 -->|"CXLTransport::send / socket"| RB
     RB -->|"recv"| ID1["Host1 IncomingDispatcher"]
@@ -104,7 +104,7 @@ flowchart LR
         R0["root[0] cxl_transport: MPSCRingBuffer[coordinator_num]"]
         R1["root[1] data_migration: 迁移/策略状态"]
         R2["root[2] lru_trackers: 迁移策略元数据"]
-        R3["root[3] global_epoch: atomic<uint64_t>"]
+        R3["root[3] global_epoch: atomic(uint64_t)"]
         R4["root[4] ebr_meta: CXL_EBR (per-host/thread local_epoch + global_epoch)"]
         DYN["动态分配：CXLTable(B+Tree/CCHashTable) 索引 / 行 TwoPLPashaMetadataShared+SCC data / 迁移策略节点"]
     end
@@ -372,7 +372,7 @@ sequenceDiagram
     RH-->>MSG: DATA_MIGRATION_RESPONSE(success,key_offset)
     MSG-->>H: data_migration_response_handler
     H->>CT: get_migrated_row() —— hit
-    H->>H: remote_take_write_lock_and_read() (smeta->lock + SCC prepare_read + ref_cnt++)
+    H->>H: remote_take_write_lock_and_read() (smeta.lock + SCC prepare_read + ref_cnt++)
     Note over T: execution_phase 改值
     E->>T: commit() → 见 §5.11
 ```
@@ -512,10 +512,10 @@ sequenceDiagram
     A->>A: lock_request_handler (remote 分支)
     A->>A: get_migrated_row() → miss
     A->>B: DATA_MIGRATION_REQUEST (key, txn_id, key_offset), pendingResponses++
-    B->>B: data_migration_request_handler → migration_manager->move_row_in(table,key,row)
+    B->>B: data_migration_request_handler → migration_manager.move_row_in(table,key,row)
     B-->>A: DATA_MIGRATION_RESPONSE (success, key_offset)
     A->>A: get_migrated_row() → hit; remote_take_read_lock_and_read()
-    Note over A: smeta->lock + SCC prepare_read + ref_cnt++ + memcpy
+    Note over A: smeta.lock + SCC prepare_read + ref_cnt++ + memcpy
 ```
 
 OnDemand 模式下，对端在 `move_row_in` 失败（CXL 满）时触发 `move_row_out(partition_id)` 腾位。
@@ -536,7 +536,7 @@ OnDemand 模式下，对端在 `move_row_in` 失败（CXL 满）时触发 `move_
 ```mermaid
 flowchart LR
     subgraph 索引顺序
-        k0["k0 (区间左外)"] --> k1["k1 ∈[min,max]"] --> k2["k2 ∈[min,max]"] --> k3["k3 (区间右外, '下一把')"]
+        k0["k0 区间左外"] --> k1["k1 在区间内"] --> k2["k2 在区间内"] --> k3["k3 区间右外 (下一把)"]
     end
     note1["扫描锁住 k1,k2 + 右边界 k3<br/>→ 阻止在 k2..k3 之间插入新 key"]
     k3 -.被锁.-> note1
@@ -813,13 +813,13 @@ TwoPLPasha::abort (TwoPLPasha.h:67)
 
 ```mermaid
 flowchart LR
-    EX["Executor::flush_messages\n(core/Executor.h:347)"] --> OQ["out_queue / out_to_in_queue(同机回环)"]
-    OQ --> OD["OutgoingDispatcher\ngroupOrDispatchMessages/dispatchGroupMessages\n(Dispatcher.h:310/333)"]
+    EX["Executor::flush_messages<br/>(core/Executor.h:347)"] --> OQ["out_queue / out_to_in_queue(同机回环)"]
+    OQ --> OD["OutgoingDispatcher<br/>groupOrDispatchMessages/dispatchGroupMessages<br/>(Dispatcher.h:310/333)"]
     OD -->|use_cxl_transport| CT["CXLTransport::send → MPSCRingBuffer::enqueue(+clwb)"]
     OD -->|else| SK["socket write_n_bytes"]
     CT --> RB[("MPSCRingBuffer (CXL)")]
     SK --> NET[("TCP")]
-    RB --> ID["IncomingDispatcher\nfetchMessageFromCoordinator(Dispatcher.h:167)"]
+    RB --> ID["IncomingDispatcher<br/>fetchMessageFromCoordinator(Dispatcher.h:167)"]
     NET --> ID
     ID -->|push_message| INQ["worker in_queue"]
     INQ --> PR["Executor::process_request → messageHandlers[type] (Executor.h:317)"]
@@ -861,9 +861,9 @@ classDiagram
 
 ```mermaid
 flowchart TB
-    C["Coordinator ctor (GROUP_WAL 分支)"] --> EP["host0: cxlalloc_malloc(global_epoch)+commit\n其余 host: wait_and_retrieve (:66-73)"]
+    C["Coordinator ctor (GROUP_WAL 分支)"] --> EP["host0: cxlalloc_malloc(global_epoch)+commit<br/>其余 host: wait_and_retrieve (:66-73)"]
     C --> Q["new vector&lt;LockfreeLogBufferQueue*&gt;"]
-    Q --> SL["每 worker: new LockfreeLogBufferQueue (:79)\n+ new PashaGroupCommitLoggerSlave(queue, global_epoch) → context.slave_loggers (:81)"]
+    Q --> SL["每 worker: new LockfreeLogBufferQueue (:79)<br/>+ new PashaGroupCommitLoggerSlave(queue, global_epoch) → context.slave_loggers (:81)"]
     Q --> MA["new PashaGroupCommitLogger(file, queues, global_epoch, ioStopFlag, ...) (:83)"]
     MA --> ST["Coordinator::start 起 master 线程 PashaGroupCommitLogger::start + pin_thread_to_core (:208-211)"]
 ```
