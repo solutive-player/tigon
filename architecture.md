@@ -420,7 +420,7 @@ sequenceDiagram
 | `CXLMemory`（`common/CXLMemory.h`） | 分类计量 + 5 个 root index + 跨 host 初始化握手 | `commit_shared_data_initialization`/`wait_and_retrieve_cxl_shared_data` |
 | `AtomicOffsetPtr<T>`（`atomic_offset_ptr.hpp`） | CXL 中可 CAS 的偏移指针 | 偏移相对 `this`，跨进程有效 |
 | `MPSCRingBuffer`/`CXLTransport`（`MPSCRingBuffer.h`/`CXLTransport.*`） | 共享内存消息环 | `enqueue`/`dequeue` 配 `clwb`/`clflush`+`sfence` |
-| `CXL_EBR`（`CXL_EBR.*`） | 4-epoch 跨 host 内存回收 | `enter_critical_section`/`add_retired_object` |
+| `CXL_EBR`（`CXL_EBR.*`） | 跨 host epoch-based 内存回收（3 槽环 / 2-epoch 宽限，详见 §5.15） | `enter_critical_section`/`add_retired_object` |
 | `WALLogger` 家族（`WALLogger.h`） | redo 日志 + epoch group commit | 见 §5.14 |
 | `CCHashTable`/`CCSet`、`btree_olc_cxl/BTreeOLC_CXL` | CXL 内崩溃一致索引 | 节点不释放，`offset_ptr` 链 |
 
@@ -948,17 +948,148 @@ sequenceDiagram
 | 恢复重放 | 本仓库**只写不回放**（无 recovery 路径） |
 | `emulated_persist_latency` | master 用 `DirectFileWriter`，要求其为 0（`CHECK`） |
 
-### 5.15 EBR 内存回收流
+### 5.15 CXL_EBR 跨 host 内存回收（深挖）
+
+源码：`common/CXL_EBR.h`（全文）+ `common/CXL_EBR.cpp`（仅定义 `CXL_EBR *global_ebr_meta = nullptr;`）。调用点：`core/Coordinator.h:441-447`（建/取）、`core/Executor.h:84-85/131/224`（init/进入/统计）、`common/btree_olc_cxl/BTreeOLC_CXL.h` 与 `protocol/TwoPLPasha/TwoPLPashaHelper.h`（退休对象）。
+
+#### 5.15.0 为什么 CXL 需要 EBR
+
+CXL 共享区里的无锁数据结构（`BTreeOLC_CXL` 节点、迁移行 `TwoPLPashaMetadataShared`/`TwoPLPashaSharedDataSCC`）可能被**其它 host 的线程**正持有裸指针/偏移指针读取。当一行被删除或一个 B+Tree 节点被合并/分裂回收时，**不能立刻 `cxlalloc_free`**——否则并发读者会访问已释放内存。EBR（Epoch-Based Reclamation）通过「延迟释放 + epoch 宽限期」保证：只有当**所有 host 的所有 worker 都越过了两个 epoch**之后，才真正释放，从而确保无悬垂引用。
+
+#### 5.15.1 关键常量与数据结构（`CXL_EBR.h`）
+
+```cpp
+static constexpr uint64_t max_ebr_retiring_memory = 1*1024*1024; // 1MB（已声明，当前未使用）  :18
+static constexpr uint64_t max_epoch              = 3;            // retired_objects 槽位数（按 epoch%3 索引）  :21
+static constexpr uint64_t max_coordinator_num    = 8;            // ≤8 host（硬编码上限）  :23
+static constexpr uint64_t max_thread_num         = 5;            // ≤5 worker（硬编码上限）  :24
+static constexpr uint64_t epoch_advance_threshold= 100;          // 当前 epoch 退休对象≥100 才尝试推进  :27
+```
+
+| 结构 | 位置 | 字段 | 作用 |
+|---|---|---|---|
+| `retired_object` `:29` | — | `ptr` / `size` / `category` | 一个待释放对象（category 见 5.15.2） |
+| `EBRMetaLocal` `:42` | **本地 DRAM**（`static thread_local`，`get_local_ebr_meta()` `:192`） | `coordinator_id` / `thread_id` / `last_freed_epoch` / `retired_objects[3]` / 统计 | 每线程私有的退休对象环（3 槽） |
+| `EBRMetaCXL` `:56` | **CXL 共享区** | `atomic<uint64_t> local_epoch` | 每 (host,thread) 的本地 epoch，跨 host 可见 |
+| `global_epoch` `:201` | **CXL 共享区**（整个 `CXL_EBR` 对象在 CXL 中） | `atomic<uint64_t>` | 全局单调 epoch |
+| `cxl_ebr_meta_vec[8][5]` `:203` | **CXL 共享区** | `EBRMetaCXL` 二维数组 | 所有 (host,thread) 的 local_epoch 表 |
+
+> 关键划分：**退休对象列表在本地 DRAM**（各线程释放自己的垃圾，无竞争）；**epoch 计数在 CXL**（跨 host 协调）。
+
+#### 5.15.2 退休对象的 category（`CXLMemory.h:33-37`）
+
+`add_retired_object` 的第三参 category 用于分类计量释放：`INDEX_FREE` / `METADATA_FREE` / `DATA_FREE` / `TRANSPORT_FREE` / `MISC_FREE`。实际调用：
+- `BTreeOLC_CXL.h:691/1006/1024/1661/2565/2579/2600/2612`：回收 B+Tree 节点（`sibling`/`parentNode`/`ptr`，`kLeafPageSize`，`INDEX_FREE`）。
+- `TwoPLPashaHelper.h:1666/1767/1986`：回收迁移行 SCC 数据（`TwoPLPashaSharedDataSCC`，`DATA_FREE`）。
+- `TwoPLPashaHelper.h:1669/1770/1989`：回收迁移行元数据（`TwoPLPashaMetadataShared`，`METADATA_FREE`）。
+
+#### 5.15.3 内存布局示意
+
+```mermaid
+flowchart LR
+    subgraph DRAM["每线程本地 DRAM (static thread_local)"]
+        L0["EBRMetaLocal: last_freed_epoch + retired_objects[0..2](3槽环) + 统计"]
+    end
+    subgraph CXLR["CXL 共享区 (root_index=4, MISC_ALLOCATION)"]
+        G["global_epoch (atomic)"]
+        V["cxl_ebr_meta_vec[host][thread].local_epoch (atomic)"]
+    end
+    L0 -.读/写自己的槽.-> L0
+    L0 -->|enter_critical_section 读| G
+    L0 -->|catch up 时写| V
+    L0 -->|推进判定时遍历全部| V
+```
+
+#### 5.15.4 生命周期与三条调用栈
+
+**(a) 初始化**（沿用 host0-建-others-等，见 §5.2）
 
 ```
-CXL_EBR::enter_critical_section (CXL_EBR.cpp)
-├─ 读 local_epoch / global_epoch
-├─ 若本 epoch 对象数≥阈值 且 所有线程都已到当前 epoch → CAS global_epoch++
-├─ 回收 epoch (global_epoch-2) 的 retired_objects → cxlalloc_free
-add_retired_object(ptr,size,category)  // 延迟释放，入当前 epoch 列表
+Coordinator::initCXLEBR (core/Coordinator.h:435)
+├─ host0: cxlalloc_malloc_wrapper(sizeof(CXL_EBR), MISC_ALLOCATION)  :441
+│         placement new CXL_EBR(coordinator_num, worker_num)         :442
+│         commit_shared_data_initialization(cxl_global_ebr_meta_root_index, global_ebr_meta)  :443
+└─ 其余 host: wait_and_retrieve_cxl_shared_data(...) → global_ebr_meta  :446-447
+Executor::start (core/Executor.h:84)
+└─ global_ebr_meta->thread_init_ebr_meta(coordinator_id, id)  :85
+   └─ thread_id = thread_id_candidate++（进程内静态原子计数）  CXL_EBR.h:73
+   └─ last_freed_epoch=0; 清 retired_objects[0..2]
 ```
 
-4-epoch 设计保证「若某线程在 epoch k，则 epoch k-2 的对象必无引用」。
+**(b) 退休对象（延迟释放）**
+
+```
+<删行 / 迁出 / B+Tree 节点回收>
+└─ global_ebr_meta->add_retired_object(ptr, size, category)  CXL_EBR.h:87
+   ├─ cur_local_epoch = cxl_ebr_meta_vec[cid][tid].local_epoch.load()  :94
+   └─ retired_objects[cur_local_epoch % 3].push_back({ptr,size,category})  :97-99  // 不释放，仅入当前 epoch 槽
+```
+
+**(c) 进入临界区（推进 epoch + 回收）**——每个事务开头调用一次
+
+```
+Executor::start 主循环 (core/Executor.h:131)
+└─ global_ebr_meta->enter_critical_section()  CXL_EBR.h:102
+   ├─ cur_local_epoch  = cxl_ebr_meta_vec[cid][tid].local_epoch.load()  :109
+   ├─ cur_global_epoch = global_epoch.load()                            :112
+   ├─ if (global==local):                                               :114
+   │    if (retired_objects[local%3].size() >= 100):                    :118  // epoch_advance_threshold
+   │       for host i in 0..coordinator_num, thread j in 0..thread_num:  :122-130
+   │          if (cxl_ebr_meta_vec[i][j].local_epoch < cur_global) advance=false  // 有线程没跟上→不推进
+   │       if (advance): global_epoch.CAS(cur_global, cur_global+1)      :133-135
+   │  else: CHECK(global > local)                                        :139
+   ├─ cur_global = global_epoch.load()   // 重新读                       :143
+   ├─ if (local < global):                                              :146
+   │     CHECK(local == global-1); local_epoch.store(global)            :147-148  // 本线程 catch up
+   └─ if (global >= 2):                                                  :152
+        epoch_to_reclaim = global - 2                                    :153
+        if (epoch_to_reclaim > last_freed_epoch):                       :154
+           CHECK(== last_freed_epoch + 1)                               :155
+           for o in retired_objects[epoch_to_reclaim % 3]:              :159
+              cxlalloc_free(o.ptr)                                      :160  // 真正释放
+           last_freed_epoch = epoch_to_reclaim; 清该槽                   :168-169
+```
+
+> `leave_critical_section()` 是 `CHECK(0)`（`:174-177`）——**未使用**。本实现不是对称的 enter/leave 临界区，而是把每个事务的 `enter_critical_section` 当作一次「静止点（quiescent state）」：在此推进 epoch 并回收两代以前的垃圾。
+
+#### 5.15.5 epoch 推进时序
+
+```mermaid
+sequenceDiagram
+    participant Ti as 本线程(host i, thread j)
+    participant CXL as cxl_ebr_meta_vec + global_epoch
+    participant Others as 其它所有(host,thread)
+    Ti->>CXL: load local_epoch, global_epoch
+    alt local == global 且 本槽垃圾>=100
+        Ti->>Others: 遍历 cxl_ebr_meta_vec 检查是否都 >= global
+        alt 全部跟上
+            Ti->>CXL: CAS global_epoch = global+1
+        else 有线程落后
+            Note over Ti: 放弃推进(下次再试)
+        end
+    end
+    Ti->>CXL: 若 local < global 则 local_epoch = global (catch up)
+    Ti->>Ti: 若 global>=2 回收 retired_objects[(global-2)%3] → cxlalloc_free
+```
+
+#### 5.15.6 正确性论证（3 槽 / 2-epoch 宽限）
+
+- **不变式**：`local_epoch <= global_epoch`，且 `global_epoch` 只在**所有** (host,thread) 的 `local_epoch >= cur_global` 时才 +1（`:122-135`）。
+- 因此当 `global_epoch` 推进到 `E` 时，意味着所有线程都已**至少进入 epoch `E-1`**，不可能再持有 epoch `E-2` 之前进入临界区时获得的引用。
+- 故在 `global == E` 回收 `E-2` 的退休对象是安全的（`:152-153`）。3 个槽位（`% max_epoch=3`）足够区分「当前 / 上一代 / 待回收」三代，槽位 `e` 与 `e+3` 复用，但 `e+3` 远在 `e+2` 回收之后才到达，不冲突。
+- 注意这是 **2-epoch 宽限 + 3 槽**，并非「4-epoch」。
+
+#### 5.15.7 设计动机与坑点
+
+| 维度 | 说明 |
+|---|---|
+| 为何 epoch 计数放 CXL、退休列表放 DRAM | 计数需跨 host 可见（协调）；释放各管各的（无竞争、无跨 host 写放大） |
+| 为何 piggyback 在事务开头 | `enter_critical_section` 每事务一次（`Executor.h:131`），把 GC 摊薄到正常路径；`threshold=100` 限制推进开销 |
+| **硬编码上限** | `max_coordinator_num=8`、`max_thread_num=5` → 超过会越界访问 `cxl_ebr_meta_vec[8][5]`（§7 已列） |
+| **liveness 依赖** | 任一线程长期不调用 `enter_critical_section`（空闲/阻塞）会卡住 `global_epoch` 推进 → 垃圾堆积（经典 EBR 弱点） |
+| 未使用项 | `max_ebr_retiring_memory`（1MB）声明但未用；`leave_critical_section` 为 `CHECK(0)` |
+| `thread_id` 分配 | 来自**进程内**静态原子 `thread_id_candidate++`（`:73`），依赖初始化顺序，配合 cap=5 |
+| 与 B+Tree 自带 EBR 的关系 | `btree_olc_cxl/EBR_CXL.h` 的**树内 EBR 被禁用**（仅统计）；B+Tree 节点回收实际改走本 `CXL_EBR`（`add_retired_object(..., INDEX_FREE)`） |
 
 ### 5.16 SCC 读写一致性流
 
