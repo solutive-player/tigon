@@ -798,16 +798,132 @@ stateDiagram-v2
     RefReleased --> [*]: 行可被 move_row_out 迁出
 ```
 
-### 5.12 中止流
+### 5.12 Abort（中止流）深挖
+
+源码：`TwoPLPasha::abort`（`protocol/TwoPLPasha/TwoPLPasha.h:67-339`）、abort 标志与 `should_abort`（`TwoPLPashaTransaction.h:170-191,526-527`）、Executor 决策与重试（`core/Executor.h:132-206`）。
+
+#### 5.12.0 三种 abort 标志与触发原因
+
+事务用四个布尔标志记录中止意图（`TwoPLPashaTransaction.h:526`），`should_abort() = abort_lock || abort_read_validation || abort_insert || abort_delete`（`:190-191`）。各标志的设置点与**原因**：
+
+| 标志 | 设置点（`file:line`） | 原因（语义） |
+|---|---|---|
+| `abort_lock` | `TwoPLPashaTransaction.h:386` | 本地读/写**锁获取失败**（行被其他事务持锁，`lock_request_handler` 返回 success=false） |
+| `abort_lock` | `TwoPLPashaTransaction.h:409` | 本地**扫描**加锁失败（`scanRequestHandler` local 分支） |
+| `abort_lock` | `TwoPLPashaMessage.h:236` | 远程**迁入失败**：对端 `move_row_in` 返回 `FAIL_OOM`（CXL 满，`:187-188` 置 success=false） |
+| `abort_lock` | `TwoPLPashaMessage.h:247` | 迁入后 `get_migrated_row` 为 null（行又被迁出，竞态） |
+| `abort_lock` | `TwoPLPashaMessage.h:270` | 远程**加锁失败**（`remote_take_read/write_lock_and_read` success=false） |
+| `abort_lock` | `TwoPLPashaMessage.h:517/520` | 远程**插入响应**失败（`remote_insert_response_handler`） |
+| `abort_insert` | `TwoPLPashaTransaction.h:434`、`TwoPLPashaExecutor.h:411/511` | **插入失败**（`insert_and_update_next_key_info` 失败，如键已存在 / next-key 锁竞争） |
+| `abort_delete` | `TwoPLPashaTransaction.h:455`、`TwoPLPashaExecutor.h:535/547` | **删除处理失败** |
+| `abort_read_validation` | （声明于 `:526`，Sundial 风格读验证） | 2PL 下基本不触发（TwoPLPasha 不做乐观读验证） |
+
+> 归纳两大类原因：**(1) 并发锁冲突**（本地或远程，最常见，对应 README 的 `n_abort_lock`）；**(2) CXL 容量不足（FAIL_OOM）/ 迁移竞态**（迁入失败）；**(3) 插入/删除维护失败**。
+
+#### 5.12.1 两个 abort 进入点（在事务生命周期中的位置）
+
+```mermaid
+flowchart TB
+    EX["execute() → process_requests()"] -->|"无 abort 标志(should_abort=false)"| OK["返回 READY_TO_COMMIT"]
+    EX -->|"加锁/插入/删除失败 → should_abort=true"| AB1["返回 ABORT"]
+    OK --> CM["protocol.commit()"]
+    CM -->|"提交期远程消息又置 abort_lock"| AB2["commit 内 if txn.abort_lock 则 abort() 后 return false"]
+    CM -->|"一路成功"| DONE["return true 提交"]
+    AB1 --> EXEC["Executor: protocol.abort() + 计数 + 重试"]
+    AB2 --> EXEC
+```
+
+- **进入点 A（执行期）**：`process_requests` 中加锁/插入/删除失败置标志并 `goto process_net_req_and_ret`，最终 `execute` 返回 `ABORT` → Executor 调 `protocol.abort()`（`Executor.h:192-194`）。
+- **进入点 B（提交期）**：`process_requests` 未中止、`execute` 返回 `READY_TO_COMMIT`，但提交期 `sync_messages`/远程响应把 `abort_lock` 置真 → `commit` 开头 `if (txn.abort_lock) { abort(txn, messages); return false; }`（`TwoPLPasha.h:343-346`）。
+
+#### 5.12.2 Executor 的 commit/abort/retry 决策（调用栈）
+
+```
+Executor::start 主循环 (core/Executor.h:132)
+└─ result = transaction->execute(id)
+   ├─ READY_TO_COMMIT:
+   │    commit = protocol.commit(txn, messages)   :146   // 内部可能 abort 并返回 false
+   │    if (commit):  n_commit++; retry=false                        :153-164
+   │    else:         if abort_lock → n_abort_lock++ else DCHECK(abort_read_validation)→n_abort_read_validation++  :176-181
+   │                  if sleep_on_retry: sleep(rand)                  :182-184
+   │                  random.set_seed(last_seed); retry=true          :185-186  // 复用同一随机种子重放
+   ├─ ABORT_NORETRY:  protocol.abort(); n_abort_no_retry++; retry=false  :188-191
+   └─ ABORT:          protocol.abort(); 计数(abort_lock/read_validation); set_seed; retry=true  :192-206
+```
+
+要点：
+- 中止后 `random.set_seed(last_seed)`（`:185/204`）——**用同一随机种子重放同一逻辑事务**，保证重试的是「相同」事务（确定性重放）。
+- `sleep_on_retry`（`:182`）可选退避，缓解活锁。
+- 计数器对应 README 输出：`n_abort_lock` / `n_abort_no_retry` / `n_abort_read_validation`。
+
+#### 5.12.3 `abort()` 内部过程（回滚 + 放锁 + 减引用）
+
+`abort()` 按 `enable_phantom_detection` 分两支（`TwoPLPasha.h:69` / `:233`），但核心动作一致：
 
 ```
 TwoPLPasha::abort (TwoPLPasha.h:67)
-├─ phantom: 回滚已建的 placeholder 插入
-├─ release_lock（释放已拿锁）
-├─ release_migrated_rows（减 ref_cnt）
-└─ Reactive: 发 DATA_MOVEOUT_HINT  (:333-338)
-→ Executor 重试该事务
+├─ 回滚 insertSet（仅 get_processed()==true 的）         :73-99 / :237-255
+│    └─ local: table->remove(key) 删 placeholder          :85 / :249
+│    └─ phantom: 同时 write_lock_release(next_row 的锁)    :89-94
+├─ 回滚 deleteSet                                          :257-278
+│    └─ 非 phantom: search(key) + write_lock_release       :270-273
+│    └─ phantom: 无需动作（锁在 scanSet/writeSet 释放）    :101-102
+├─ 释放 readSet 的读/写锁                                  :105-150 / :281-326
+│    └─ read_lock_bit:  read_lock_release / remote_read_lock_release
+│    └─ write_lock_bit: write_lock_release / remote_write_lock_release
+├─ phantom: 释放 scanSet 的 next-row 锁 + 各扫描行锁        :152-232
+│    └─ 按 SCAN_FOR_READ/UPDATE/INSERT/DELETE 分派 read/write release
+├─ release_migrated_rows(txn)  // 对 reference_counted 行减 ref_cnt   :330
+└─ if Reactive: 对 remote_hosts_involved 发 DATA_MOVEOUT_HINT          :332-338
 ```
+
+**关键差异（与 commit 对比）**：abort **不写 commit record、不应用任何写**（writeSet 中的新值被丢弃），且对已建的 placeholder 主动 `table->remove`。因为是 2PL，写只在提交期才 apply（`write_and_replicate`），所以中止时数据页面从未被脏写 → **无 undo 需求**，只需删 placeholder + 放锁。
+
+#### 5.12.4 中止行为时序
+
+```mermaid
+sequenceDiagram
+    participant E as Executor
+    participant T as Transaction
+    participant P as TwoPLPasha
+    participant H as Helper(锁/CXL)
+    T->>T: process_requests 加锁失败 → abort_lock=true
+    T-->>E: execute() 返回 ABORT
+    E->>P: protocol.abort(txn, messages)
+    P->>H: 回滚 insert placeholder (table.remove)
+    P->>H: release readSet/scanSet 读写锁 (本地/remote)
+    P->>H: release_migrated_rows 减 ref_cnt
+    opt Reactive
+        P-->>E: 发 DATA_MOVEOUT_HINT
+    end
+    P-->>E: 返回
+    E->>E: 计数 n_abort_lock，random.set_seed(last_seed)，retry=true
+    E->>T: 用同一种子重放该事务
+```
+
+#### 5.12.5 锁 / 引用计数状态机（中止路径）
+
+```mermaid
+stateDiagram-v2
+    [*] --> PartiallyLocked: process_requests 期间逐步加锁/建 placeholder/inc ref_cnt
+    PartiallyLocked --> Aborting: 某步失败置 abort_*（或提交期 abort_lock）
+    Aborting --> InsertsRolledBack: table.remove(placeholder)
+    InsertsRolledBack --> LocksReleased: read/write_lock_release（本地+remote）
+    LocksReleased --> RefReleased: release_migrated_rows（ref_cnt--）
+    RefReleased --> Retried: set_seed(last_seed) 重放
+    Retried --> [*]
+```
+
+#### 5.12.6 坑点与注意
+
+| 项 | 依据 | 说明 |
+|---|---|---|
+| 计数路径只稳健处理 `abort_lock`/`abort_read_validation` | `Executor.h:176-181/195-200` | 若仅 `abort_insert`/`abort_delete` 被置，`DCHECK(abort_read_validation)` 会触发——依赖工作负载不单独走该路径 |
+| 远程 insert/delete 不支持 | `abort()` 中 `DCHECK(0)`（`:97/253/276`） | abort 回滚假定 insert/delete 在本地 master 分区 |
+| 只回滚 `get_processed()==true` 的 insert | `:76-77/240-241` | 未处理的请求无需回滚 |
+| 重试用同一随机种子 | `Executor.h:185/204` | 确定性重放「相同」事务，便于一致性与统计 |
+| 无 undo | 2PL：写仅在提交期 apply | 中止只需删 placeholder + 放锁，数据未被脏写 |
+| `ABORT_NORETRY` | `Executor.h:188-191` | 业务级不可重试中止（如 TPC-C 1% rollback），计 `n_abort_no_retry`，不重放 |
 
 ### 5.13 消息收发链路
 
