@@ -20,6 +20,7 @@
 7. [技术债与坑点](#7-技术债与坑点)
 8. [构建与运行速查](#8-构建与运行速查)
 9. [术语表与参考](#9-术语表与参考)
+10. [附录 A：TPC-C / YCSB 表项结构与内存规模](#10-附录-atpc-c--ycsb-表项结构与内存规模)
 
 ---
 
@@ -1306,5 +1307,189 @@ BPlusTree::lookup/insert (common/btree_olc_cxl/BTreeOLC_CXL.h)
 - Tigon: A Distributed Database for a CXL Pod, **OSDI '25** — https://yibo-huang.github.io/papers/tigon_osdi25.pdf
 - Pasha: An Efficient, Scalable Database Architecture for CXL Pods, **CIDR '25**
 - Sundial, **VLDB '18**；Lotus（DS2PL 基线），**VLDB '22**；Motor，**OSDI '24**
+
+---
+
+## 10. 附录 A：TPC-C / YCSB 表项结构与内存规模
+
+> 源码依据：`benchmark/tpcc/Schema.h`、`benchmark/ycsb/Schema.h`、`benchmark/*/Context.h`、`benchmark/*/Database.h`、`core/Table.h`、`common/FixedString.h`、`protocol/TwoPLPasha/TwoPLPashaHelper.h`。
+
+### A.1 Schema 总览与关系
+
+**TPC-C（11 表，按 W_ID 分区；`item` 非分区单表）**。`tableID = N - __BASE_COUNTER__`（`Schema.h:19/93`），实际 ID 见下表。常量（`Schema.h:26-33`）：`DISTRICT_PER_WAREHOUSE=10`、`CUSTOMER_PER_DISTRICT=3000`、`ORDER_PER_DISTRICT=3000`、`STOCK_PER_WAREHOUSE=100000`、`ITEM_NUM=100000`、order line `[5,15]`。
+
+| tableID | 表 | key 字段 | 每 warehouse 行数 | 索引 |
+|---|---|---|---|---|
+| 0 | `warehouse` | `W_ID` | 1 | B+Tree |
+| 1 | `district` | `D_W_ID,D_ID` | 10 | B+Tree |
+| 2 | `customer` | `C_W_ID,C_D_ID,C_ID` | 30,000 | B+Tree |
+| 3 | `customer_name_idx` | `C_W_ID,C_D_ID,C_LAST` | 按不同 `C_LAST` 聚合（≤30,000） | B+Tree |
+| 4 | `history` | `H_W_ID,H_D_ID,H_C_W_ID,H_C_D_ID,H_C_ID,H_DATE` | 30,000 | B+Tree（自定义 KeyComparator） |
+| 5 | `new_order` | `NO_W_ID,NO_D_ID,NO_O_ID` | 9,000（订单 2101..3000 × 10 区，`Database.h:1343-1352`） | B+Tree |
+| 6 | `order` | `O_W_ID,O_D_ID,O_ID` | 30,000 | B+Tree |
+| 7 | `order_customer` | `O_W_ID,O_D_ID,O_C_ID,O_ID` | 30,000 | B+Tree |
+| 8 | `order_line` | `OL_W_ID,OL_D_ID,OL_O_ID,OL_NUMBER` | ≈300,000（30,000 订单 × U[5,15]） | B+Tree |
+| 9 | `item` | `I_ID` | 100,000（**全局单表，仅一份**） | B+Tree |
+| 10 | `stock` | `S_W_ID,S_I_ID` | 100,000 | B+Tree |
+
+复合主键由 `get_plain_key()` 编码为单个 `uint64_t`（如 `customer`：`(C_W_ID*11+C_D_ID)*3001+C_ID`，`Schema.h:126-130`；`order_line` 还乘 `MAX_ORDER_ID`，`:238-242`），供 B+Tree 排序与 `CCHashTable` 定位。
+
+```mermaid
+erDiagram
+    WAREHOUSE ||--o{ DISTRICT : has
+    DISTRICT ||--o{ CUSTOMER : has
+    DISTRICT ||--o{ ORDER : has
+    CUSTOMER ||--o{ ORDER : places
+    ORDER ||--o{ ORDER_LINE : contains
+    ORDER ||--o| NEW_ORDER : pending
+    CUSTOMER ||--o{ HISTORY : logs
+    CUSTOMER ||--o| CUSTOMER_NAME_IDX : indexed_by_last
+    WAREHOUSE ||--o{ STOCK : stocks
+    ITEM ||--o{ STOCK : stocked_as
+    ITEM ||--o{ ORDER_LINE : ordered_as
+```
+
+**YCSB（单表 `ycsb`，`Schema.h:25-37`）**：key `int32_t Y_KEY`；value = 10 × `FixedString<100>`（`YCSB_FIELD_SIZE=100`）。每 partition `keysPerPartition` 行（`Context.h:109`，默认 200,000；README 示例传 `KEYS=300000`）。分区策略 `RANGE`（默认）/`ROUND_ROBIN`，`getPartitionID/getGranule/getGlobalKeyID`（`Context.h:24-83`）做 key↔(partition,granule) 映射；`keysPerGranule=2000`、`keysPerTransaction=10`、`crossPartitionPartNum=2`。
+
+### A.2 单行内存布局与 sizeof 计算
+
+行在 `TableBTreeOLC` 中的存储（`core/Table.h:376-410`）：
+
+```mermaid
+flowchart LR
+    subgraph BT["B+Tree 叶节点 (leaf_page_size=4096B)"]
+        K["KeyType key"] --> V["BTreeOLCValue { ValueStruct* row } (8B 指针)"]
+    end
+    V -->|堆指针| RS["ValueStruct (new 出来, core/Table.h:527)"]
+    subgraph RS2["ValueStruct"]
+        M["meta: atomic(uint64_t) 8B"]
+        D["data: ValueType (表 value)"]
+    end
+    RS --> RS2
+    M -->|TwoPLPasha: meta 是指针| LM["堆上 TwoPLPashaMetadataLocal (Helper.h:67)"]
+    LM --> LM2["latch(pthread_spinlock)+tid+is_valid/is_migrated/...+migrated_row*+scc_data*"]
+```
+
+关键事实：
+- `FixedString<N>` = `std::array<char, N+1>` → **占 N+1 字节**（含结尾 `\0`，`FixedString.h:135`），但 `ClassOf<FixedString<N>>::size()=N`（序列化大小，`:161-167`）——**内存布局比序列化多 1 字节/字段**。
+- `ValueStruct { atomic<uint64_t> meta; ValueType data; }`（`Table.h:376-379`），每行 `new ValueStruct`（`Table.h:527`）；B+Tree 叶仅存 8B 的 `ValueStruct*`。
+- `leaf_page_size = inner_page_size = 4096`、`update_threshold=1024`（`Table.h:372-374`）。
+- TwoPLPasha 下 `meta`(8B) 是指向堆上 `TwoPLPashaMetadataLocal` 的指针（`Table.h:377` 注释 + `TwoPLPashaMetadataLocalInit`，`TwoPLPashaHelper.cpp:5`）；该结构含 `pthread_spinlock_t latch`、`tid`、若干 bool、`migrated_row`/`scc_data` 指针（`Helper.h:67`），约 40–48B/行额外开销。其它协议（`MetaInitFuncTwoPL`/`Sundial`）meta 直接是状态字（不额外分配）。
+
+**各表 value「数据字节」估算**（FixedString 按 N+1，native 按 sizeof；未计结构体对齐 padding，故为下界近似）：
+
+| 表 | value 字段构成（要点） | ≈ 数据字节 |
+|---|---|---|
+| YCSB `ycsb` | 10×`FixedString<100>` = 10×101 | **1010** |
+| `customer` | 多个 FixedString + `C_DATA(FixedString<500>)`(501) + 6×float/int + uint64 | ≈ **666** |
+| `stock` | `int16`(2) + 10×`FixedString<24>`(25 each=250) + 2×int+float(12) + `S_DATA<50>`(51) | ≈ **315** |
+| `item` | int + `FixedString<24>`(25) + float + `FixedString<50>`(51) | ≈ **84** |
+| `warehouse` | 6×FixedString(87) + 2×float(8) | ≈ **95** |
+| `order_line` | 2×int(8)+uint64(8)+int8(1)+float(4)+`FixedString<24>`(25) | ≈ **46** |
+| `new_order` | `int32 NO_DUMMY` | **4** |
+
+单行总内存 ≈ `8(meta) + ≈数据字节 + 对齐padding + sizeof(TwoPLPashaMetadataLocal)≈48 + B+Tree 叶槽摊销(key+8B 指针) + malloc 头`。例：YCSB 单行 ≈ `8 + 1010 + ~48 + 叶摊销 + malloc` ≈ **1.1–1.2 KB/行**。
+
+### A.3 建表数据流与调用栈
+
+```
+main (bench_*.cpp) → db.initialize(context)
+└─ Database::initialize (benchmark/*/Database.h)
+   └─ initTables(name, initFunc, partitionNum=context.partition_num, threadsNum, partitioner)  (tpcc:124 / ycsb:57)
+      └─ for partitionID in 0..partitionNum:
+         └─ 按 context.protocol 选模板参数 MetaInitFunc，构造表对象:
+            new TableBTreeOLC<key, value, KeyComparator, ValueComparator, MetaInitFuncTwoPLPasha>(tableID, partitionID)  (tpcc:184 / ycsb:112)
+         └─ 多线程并行调用 initFunc(partitionID) 装载（见 A.4）
+（CXL 协议额外）create_or_retrieve_cxl_tables(context)   ycsb/Database.h:204
+   ├─ host0: cxlalloc_malloc_wrapper(... INDEX_ALLOCATION) 建 CXLTableBTreeOLC::CXLBTree + commit  :217-223
+   ├─ 其余 host: wait_and_retrieve_cxl_shared_data → 复用指针             :234-238
+   └─ PRE_MIGRATE 时 tbl_vecs[i][j]->move_all_into_cxl(move_in_func)     :250-259
+```
+
+`MetaInitFunc` 由协议决定（`Table.h:128-170`）：`MetaInitFuncTwoPLPasha`/`MetaInitFuncSundialPasha`/`MetaInitFuncTwoPL`/`MetaInitFuncSundial`/`MetaInitFuncNothing`，初始化每行 `meta` 字（或分配 local 元数据）。
+
+### A.4 装载 / 插入数据流与调用栈
+
+```
+initFunc(partitionID)  // 如 ycsbInit / stockInit / orderLineInit ...
+└─ 循环构造 key/value（FixedString.assign 填随机串）
+   └─ table->insert(&key, &value)            ITable
+      └─ TableBTreeOLC::insert (core/Table.h:527)
+         ├─ ValueStruct *row = new ValueStruct;                 :527
+         ├─ row->meta = MetaInitFunc()(is_tuple_valid);          :529  // TwoPLPasha: 分配 TwoPLPashaMetadataLocal 并存指针
+         ├─ row->data = *value;                                  // 拷贝 value
+         └─ btree.insert(key, BTreeOLCValue{row});               :536  // 叶节点存 8B 指针
+└─ 末尾 table->insert(max_key, dummy)  // next-key locking 哨兵
+       ycsb/Database.h:321；tpcc 各表 :1329/1391/1441/1484/1569/1641/...
+```
+
+**每表行数公式**（per partition=warehouse；`P`=`partition_num`）：
+
+| 表 | 行数公式 |
+|---|---|
+| warehouse | 1 |
+| district | `DISTRICT_PER_WAREHOUSE`=10 |
+| customer / history / order / order_customer | `10 × CUSTOMER_PER_DISTRICT`=30,000（order 用 `ORDER_PER_DISTRICT`） |
+| new_order | `10 × (3000-2100)`=9,000 |
+| order_line | `Σ orders U[5,15]` ≈ `30,000 × 10`=300,000 |
+| stock | `STOCK_PER_WAREHOUSE`=100,000 |
+| item | `ITEM_NUM`=100,000（全局一份，不随 P 扩展） |
+| YCSB `ycsb` | `keysPerPartition`（默认 200,000）+ 1 哨兵 |
+
+### A.5 删除流程（运行期 vs 装载期）
+
+装载期只插不删。运行期删除见 [§5.10 删除流](#510-删除流) 与 [§5.11.5](#5115-删除提交-447-520)：本地 `migration_manager->delete_specific_row_and_move_out(table,key,true)`，远程 `remote_modify_tuple_valid_bit(false)` + `new_remote_delete_message`；删除的 CXL 元数据/SCC 数据经 §5.15 的 `CXL_EBR::add_retired_object`(`METADATA_FREE`/`DATA_FREE`) 延迟回收。TPC-C 的 Delivery 事务会从 `new_order` 删行（标准负载行为）。
+
+### A.6 内存容量规模计算
+
+**DRAM 表占用**（host-local，**不计入** CXLMemory 统计）估算：
+
+```
+表_DRAM ≈ 行数 × ( 8(meta指针) + sizeof(value) + sizeof(TwoPLPashaMetadataLocal)≈48
+                   + B+Tree 叶/内节点摊销 + malloc 头≈16 )
+host_DRAM ≈ Σ_owned_partitions Σ_tables 表_DRAM
+```
+
+**TPC-C 单 warehouse 粗估**（量级，未精确对齐；TwoPLPasha）：
+
+| 表 | 行数 | ≈ 单行总字节 | ≈ 小计 |
+|---|---|---|---|
+| order_line | 300,000 | ~130 | ~39 MB |
+| stock | 100,000 | ~390 | ~39 MB |
+| customer | 30,000 | ~740 | ~22 MB |
+| order / order_customer / history | 3×30,000 | ~90–140 | ~10 MB |
+| new_order / district / warehouse | 小 | — | <1 MB |
+| **合计/仓库** | | | **≈110–120 MB** |
+| item（全局一份） | 100,000 | ~150 | ~15 MB（仅一份） |
+
+故 `partition_num`（=warehouse 数）每 +1 ≈ +110–120 MB DRAM。**YCSB**：每 partition `keysPerPartition × ~1.15 KB`（默认 200k → ~230 MB；README 的 300k → ~345 MB/partition）。
+
+**CXL 占用**由 `CXLMemory` 分类计量，对应 README 结尾 `Global Stats`：
+
+| README 字段 | CXLMemory 分类 | 内容 |
+|---|---|---|
+| `total_size_index_usage` | `INDEX_ALLOCATION` | CXLTable B+Tree / CCHashTable 节点 |
+| `total_size_metadata_usage` | `METADATA_ALLOCATION` | 迁移行 `TwoPLPashaMetadataShared` + 迁移策略元数据 |
+| `total_size_data_usage` | `DATA_ALLOCATION` | 迁移行数据 `TwoPLPashaSharedDataSCC` |
+| `total_size_transport_usage` | `TRANSPORT_ALLOCATION` | MPSCRingBuffer 条目 |
+| `total_hw_cc_usage` | — | 当前 HW-cc 迁移区占用 |
+| `total_usage` | 合计 | 全部 CXL 分配 |
+
+`HW_CC_BUDGET`（`context.hw_cc_budget`，README 示例 `200000000`≈200MB）限制 CXL HW-cc 迁移区上限；超出触发 `move_row_out`（§5.7）。即「热点行迁入 CXL 的总量 ≤ HW_CC_BUDGET」，其余留在各 host DRAM。
+
+### A.7 配置与缩放
+
+| 维度 | TPC-C | YCSB |
+|---|---|---|
+| 规模主参 | `partition_num` = warehouse 数（命令行 `HOST_NUM`/`partition`，每仓 ~110MB DRAM） | `keysPerPartition`（命令行 `KEYS`）× `partition_num` |
+| 跨分区 | `newOrderCrossPartitionProbability`(默认10) / `paymentCrossPartitionProbability`(默认15) | `crossPartitionProbability` + `crossPartitionPartNum`(默认2) |
+| 分区策略 | 按 W_ID（`get_plain_key`） | `RANGE`(默认)/`ROUND_ROBIN`（`Context.h:117`） |
+| granule | `granules_per_partition`（细粒度锁） | `keysPerGranule`=2000 |
+| CXL 上限 | `HW_CC_BUDGET` | `HW_CC_BUDGET` |
+| 预迁移 | `PRE_MIGRATE`=None/NonPart/All | 同左（`move_all_into_cxl`） |
+
+命令行各参数语义见 `README.md`「Test Tigon in Various Configurations」。
+
+---
 
 > 注：本文 `file:line` 基于撰写时的代码快照，若源码改动请以实际行号为准。
