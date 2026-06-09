@@ -129,7 +129,7 @@ flowchart TD
     O --> P["return true"]
 ```
 
-每一步都被 `ScopedTimer` 包裹，析构时把耗时回填到事务的细分计时器（见 §8）。下表给出每步的源码位置、计时桶与职责。
+每一步都被 `ScopedTimer` 包裹，析构时把耗时回填到事务的细分计时器（见 §8）。下表给出每步的源码位置、计时桶与职责。**每步与其它节点的交互（CXL 直访 vs 消息）详见 §13。**
 
 | Step | 代码位置 | 计时桶 (record_*) | 职责 |
 |------|----------|-------------------|------|
@@ -1067,7 +1067,182 @@ abort 不写 commit record，redo buffer 中已写的 redo 记录因没有对应
 
 ---
 
-## 13. 关键代码引用索引
+## 13. commit 七步深度展开与跨节点交互（CXL 直访 vs 消息）
+
+本节把 §3 的七步逐一拆到**与其它节点交互**的粒度。Tigon（Pasha 架构）有**两条**跨节点通道，commit 的每一步只走其中之一或都不走：
+
+### 13.1 两条跨节点通道
+
+```mermaid
+flowchart LR
+    W["本地 worker (commit)"]
+    subgraph CH1["通道① CXL 共享内存 (直访, 经 SCC)"]
+        SMETA["远程行 smeta / scc_data<br/>(物理驻留在 CXL, 任意 host 直接 load/store)"]
+    end
+    subgraph CH2["通道② 消息 (CXLTransport)"]
+        MW["master 节点 worker<br/>(改其本地 B+Tree 索引)"]
+    end
+    W -->|"remote_update / remote_write_lock_release / remote_modify_tuple_valid_bit"| SMETA
+    W -->|"new_remote_insert/delete_message, data_moveout_hint"| MW
+```
+
+| 通道 | 用于 | 是否需要对端 worker 参与 | 典型函数 |
+|------|------|--------------------------|----------|
+| ① **CXL 直访**（经 SCC 协议） | 读/写/锁**已迁移到 CXL 的行**（行数据本身在共享内存） | 否——本地 worker 直接对 CXL 指针 load/store | `remote_update` / `remote_write_lock_release` / `remote_read/write_lock_and_inc_ref_cnt` / `remote_modify_tuple_valid_bit` |
+| ② **消息**（`CXLTransport`） | 修改 **master 的本地 B+Tree 索引结构**（插入/删除占位、迁移协调）——远程 host 无法直接改对端进程内的索引 | 是——对端 worker 在 `process_request` 里跑 handler | `new_remote_insert_message` / `new_remote_delete_message` / `new_data_move_out_hint_message` / `new_data_migration_message_for_scan` |
+
+> 核心区别：**行数据**靠 CXL 共享内存直访；**索引拓扑变更**（insert/delete 一个 key 会改 B+Tree 结构）必须发消息让 master 节点自己改。这是 Pasha “数据共享、索引私有” 架构的直接体现。
+
+### 13.2 提交相关消息类型（`TwoPLPashaMessage` 枚举，`TwoPLPashaMessage.h:20-30`）
+
+| 枚举值 | 工厂函数 | handler | 方向 | 用在 |
+|--------|----------|---------|------|------|
+| `REMOTE_INSERT_REQUEST` | `new_remote_insert_message` `:103` | `remote_insert_request_handler` `:538` | 请求 | Step4 远程插入 |
+| `REMOTE_INSERT_RESPONSE` | （handler 内构造 `:582`） | `remote_insert_response_handler` `:592` | 响应（减 `pendingResponses`） | Step4 |
+| `REMOTE_DELETE_REQUEST` | `new_remote_delete_message` `:127` | `remote_delete_request_handler` `:637` | **单向**（无响应） | Step4 远程删除 |
+| `DATA_MOVEOUT_HINT` | `new_data_move_out_hint_message` `:82` | move-out 提示 handler | **单向** | Step7 反应式迁出 |
+| `DATA_MIGRATION_REQUEST(_FOR_SCAN)` | `new_data_migration_message(_for_scan)` `:36/:58` | 迁移 handler `:152/:279` | 请求/响应 | 执行期（非 commit） |
+
+### 13.3 七步 × 跨节点交互对照表
+
+| Step | commit 源码 | 通道 | 与其它节点的交互 |
+|------|-------------|------|------------------|
+| 0' get_global_epoch | `TwoPLPasha.h:348` | ① CXL 读 | `cxl_global_epoch->load()`（读 CXL 共享原子量，§9） |
+| 1 redo 日志 | `:350-357` | 无 | 仅写本地 slave LogBuffer（§9） |
+| 2 generate_tid | `:362-366` | 无 | 纯本地 |
+| 3 commit record | `:368-381` | 无 | 写本地 slave LogBuffer |
+| 4 inserts/deletes | `:383-521` | **② 消息**（+①） | 远程插入 RPC、远程删除单向消息、远程置 valid-bit（CXL） |
+| 5 write_and_replicate | `:523-527` | ① CXL 写 | `remote_update` 直写 CXL（经 SCC `finish_write`）；复制已禁用 |
+| 6 release_lock | `:529-534` | ① CXL 写 | `remote_write_lock_release` 直写 epoch_version 到 `scc_data->tid` + `finish_write` |
+| 7 release_migrated_rows + move-out hint | `:536-545` | ② 消息（单向） | 对 `remote_hosts_involved` 发 `DATA_MOVEOUT_HINT` |
+
+### 13.4 Step 0'–3：本地为主
+
+- Step0' 读 CXL 全局 epoch（一次 CXL load）；Step1/3 把 redo 与 commit record memcpy 进**本 worker 的** `PashaGroupCommitLoggerSlave` 缓冲（§9.6），无跨 worker 交互；Step2 纯本地算 TID。
+- 即：提交的“准备 + 持久化登记”阶段**不与其它节点同步**，这是低延迟的关键。
+
+### 13.5 Step 4 详解：insert/delete 的跨节点 RPC（唯一的同步点）
+
+仅 `enable_phantom_detection == true` 分支（`TwoPLPasha.h:383-480`）。分四种情况：
+
+**(a) 本地 master 插入**（`has_master_partition`，`:393-434`）：本进程直接
+`search_and_update_next_key_info`（更新前驱/后继 real-bit）+ `modify_tuple_valid_bit(meta,true,true)` 把占位行转正。无消息。
+
+**(b) 远程 master 插入**（`:435-440`）：发 RPC，**这是 commit 中唯一会阻塞等待对端的地方**：
+
+```cpp
+// 发起方 (TwoPLPasha.h:435-440)
+auto coordinatorID = partitioner.master_coordinator(partitionId);
+txn.network_size += MessageFactoryType::new_remote_insert_message(
+        *messages[coordinatorID], *table, insertKey.get_key(), insertKey.get_value(),
+        txn.transaction_id, i);
+txn.pendingResponses++;                          // 期待一个响应
+...
+sync_messages(txn);                              // :445 flush + 自旋等所有响应
+```
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant RW as 发起 worker (commit Step4)
+    participant NET as CXLTransport
+    participant MW as master worker (process_request)
+    participant IDX as master 本地 B+Tree + CXL
+
+    RW->>RW: new_remote_insert_message, pendingResponses++
+    RW->>NET: sync_messages, message_flusher 推送
+    NET->>MW: REMOTE_INSERT_REQUEST(key, value, txn_id, key_offset)
+    MW->>IDX: insert_and_update_next_key_info(插入占位)
+    MW->>IDX: migration_manager.move_row_in(迁入 CXL)
+    MW->>NET: REMOTE_INSERT_RESPONSE(success, key_offset)
+    NET->>RW: 投递响应
+    RW->>RW: remote_modify_tuple_valid_bit(cxl_row, true), set_inserted_cxl_row, pendingResponses--
+    Note over RW: pendingResponses 归零, sync_messages 返回
+```
+
+master 端 handler `remote_insert_request_handler`（`TwoPLPashaMessage.h:538-590`）：
+`insert_and_update_next_key_info(...false...)`（`:574`）→ `migration_manager->move_row_in(...)`（`:579`，把新行迁入 CXL）→ 回 `REMOTE_INSERT_RESPONSE`（`:582-589`）。
+发起方 handler `remote_insert_response_handler`（`:592-635`）：`remote_modify_tuple_valid_bit(cxl_row,true,true)`（`:626`，经 CXL 把占位转正）+ `set_inserted_cxl_row`（`:629`）+ `set_reference_counted`（`:632`）+ `pendingResponses--`（`:634`）。
+
+**(c) 本地 master 删除**（scanSet `SCAN_FOR_DELETE`，`:463-469`）：`migration_manager->delete_specific_row_and_move_out(table, key, true)`。无消息。
+
+**(d) 远程 master 删除**（`:470-478`）：先 `remote_modify_tuple_valid_bit(cxl_row, false)`（**①CXL 直接置无效**）再发 `new_remote_delete_message`（**②单向消息**，让 master 从其 B+Tree 移除，不等响应）。
+
+**`sync_messages` 机制**（`TwoPLPasha.h:1036-1044`）：
+
+```cpp
+void sync_messages(TransactionType &txn, bool wait_response = true) {
+    txn.message_flusher();                        // = flush_messages() 把 out 消息推给 CXLTransport
+    if (wait_response)
+        while (txn.pendingResponses > 0)          // 自旋
+            txn.remote_request_handler(0);        // = process_request() 处理入站(含响应)
+}
+```
+
+调用栈：
+```
+commit Step4 (TwoPLPasha.h:445)
+└─ sync_messages (TwoPLPasha.h:1036)
+   ├─ txn.message_flusher()      → TwoPLPashaExecutor.h:557 → flush_messages() → cxl_transport.send
+   └─ while pendingResponses>0: txn.remote_request_handler(0)
+                                  → TwoPLPashaExecutor.h:556 → process_request()
+                                     → core/Executor.h:333 messageHandlers[type](piece, msg, table, txn)
+                                        → remote_insert_response_handler → pendingResponses--
+```
+
+### 13.6 Step 5 write_and_replicate：CXL 直接写回（无消息）
+
+`write_and_replicate`（`TwoPLPasha.h:550-679`）遍历 readSet 中带写锁的 key：
+- 本地行：`twopl_pasha_global_helper->update(cached_row, value, value_size)`（`:634`）；
+- **迁移行（其它节点的数据）：`remote_update(migrated_row, value, value_size)`（`:641`）——直接写 CXL 共享行**，经 SCC（WriteThrough）把新值刷出，对端无需参与。
+- 复制路径 `persist_replication` 逻辑保留但 `DCHECK(false)`（`:578`），当前未启用。
+
+即 Step5 的“跨节点”完全走 CXL 直访，**零消息**。
+
+### 13.7 Step 6 release_lock：CXL 直接放锁 + 写版本（无消息）
+
+`release_lock`（`TwoPLPasha.h:765+`）释放 readSet 锁：
+- 本地写锁：`write_lock_release(*meta, value_size, epoch_version)`（`:805`）；
+- **迁移行写锁：`remote_write_lock_release(migrated_row, value_size, epoch_version)`（`:812`）** → `TwoPLPashaHelper.h:1086`：清 `atomic_word` 写锁位、`scc_data->tid = epoch_version`、`scc_manager->finish_write(...)`——**全程 CXL 直写**，把新版本对其它 host 可见（§7.5）。
+- 读锁同理 `remote_read_lock_release`（`:789`）。
+
+### 13.8 Step 7 release_migrated_rows + 反应式迁出提示
+
+`commit` 尾部（`TwoPLPasha.h:536-545`）：
+- `release_migrated_rows(txn)`：对 Step4(b) 中 `set_reference_counted` 的远程行递减引用计数（CXL 直访），使其可被迁出。
+- 若 `migration_manager->when_to_move_out == MigrationManager::Reactive`（`:540`）：对每个 `txn.remote_hosts_involved` 发 `new_data_move_out_hint_message`（`:543`，**②单向消息**），提示对端可考虑迁出冷数据。
+
+### 13.9 端到端跨节点数据流图
+
+```mermaid
+flowchart TD
+    C["commit(txn, messages)"] --> S0["Step0' cxl_global_epoch.load (CXL读)"]
+    S0 --> S1["Step1-3 本地: redo + commit record + tid<br/>(无跨节点)"]
+    S1 --> S4{"Step4 insert/delete?"}
+    S4 -->|本地master| L4["直接改本地 B+Tree + valid-bit"]
+    S4 -->|远程master insert| R4["new_remote_insert_message<br/>pendingResponses++"]
+    R4 --> SYNC["sync_messages: flush + 自旋等响应"]
+    SYNC --> MH["master: insert占位 + move_row_in + 回响应"]
+    MH --> RESP["response: remote_modify_tuple_valid_bit(true), pendingResponses--"]
+    S4 -->|远程master delete| RD["remote_modify_tuple_valid_bit(false) [CXL]<br/>+ new_remote_delete_message [单向]"]
+    L4 --> S5
+    RESP --> S5
+    RD --> S5
+    S5["Step5 write-back: update / remote_update [CXL直写, 经SCC]"] --> S6["Step6 release_lock: write_lock_release / remote_write_lock_release [CXL直写 epoch_version]"]
+    S6 --> S7["Step7 release_migrated_rows [CXL] + DATA_MOVEOUT_HINT [单向]"]
+    S7 --> RET["return true"]
+```
+
+### 13.10 关键结论
+
+1. **commit 的同步阻塞点只有一个**：Step4 的远程 master **插入** RPC（`sync_messages` 自旋等 `REMOTE_INSERT_RESPONSE`）。其余跨节点操作要么是 CXL 直访（Step5/6/7 行数据与锁），要么是单向消息（远程删除、move-out hint），都不阻塞。
+2. **数据 vs 索引分离**：行数据的读写/加锁/版本更新全部经 **CXL 共享内存 + SCC**，无需对端 CPU 参与；只有**改对端 B+Tree 索引拓扑**（插入/删除一个 key）才发消息让对端 worker 执行。
+3. **`network_size`** 在每次发消息处累加（如 `:437/:477/:543`），用于统计；`pendingResponses` 仅由需要响应的 RPC（远程插入）增减。
+4. 非 phantom 模式（`TwoPLPashaPhantom`）下 Step4 仅处理本地 insert/delete（`DCHECK(0)` 不支持远程，`:498-499/516-518`），跨节点交互退化为只有 Step5/6 的 CXL 直访。
+
+---
+
+## 14. 关键代码引用索引
 
 | 功能 | 文件:行 |
 |------|---------|
@@ -1112,9 +1287,17 @@ abort 不写 commit record，redo buffer 中已写的 redo 记录因没有对应
 | logger 装配 + 主线程启动 | `core/Coordinator.h:55-95, 208-211` |
 | epoch 协调 (GC 系) | `core/group_commit/Manager.h:23-76` |
 | ExecutorStatus | `core/Defs.h` |
+| sync_messages (RPC 屏障) | `TwoPLPasha.h:1036-1044` |
+| message_flusher / remote_request_handler | `TwoPLPashaExecutor.h:556-557` |
+| process_request (派发 handler) | `core/Executor.h:317-340`（派发 `:333`，handler 表 `:56`） |
+| TwoPLPashaMessage 枚举 | `TwoPLPashaMessage.h:20-30` |
+| 消息工厂 (insert/delete/hint/migrate) | `TwoPLPashaMessage.h:36/58/82/103/127` |
+| remote insert 请求/响应 handler | `TwoPLPashaMessage.h:538-590 / 592-635`（`pendingResponses-- :634`） |
+| remote delete 请求 handler | `TwoPLPashaMessage.h:637+` |
+| 远程行 CXL 直访 (write-back/放锁) | `remote_update`/`remote_write_lock_release` `TwoPLPasha.h:641/812`；helper `:1086` |
 
 ---
 
-## 14. 一句话总结
+## 15. 一句话总结
 
 > Tigon 的提交是 **“2PL 锁已就绪 → 写 redo（异步缓冲）→ 生成单调 TID → 写 commit record → 应用 insert/delete → 写回新值 → 按 epoch_version 放锁”** 的同步流水线；而**持久化是异步的**：worker 只把日志 memcpy 进 per-worker 的 epoch LogBuffer，由唯一的 master logger 线程在每个 `EPOCH_LEN` 推进 `cxl_global_epoch` 并把各 worker 当前 epoch 的 buffer 统一 `write+fsync` 落盘，从而以 **epoch-based group commit** 摊薄 fsync 开销，并通过 `epoch_version = (epoch<<32 | seq)` 实现按 epoch 的崩溃一致恢复。
