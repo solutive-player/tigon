@@ -1,7 +1,7 @@
 # Tigon 性能检测数据记录全景分析
 
 > 本文档剖析 Tigon 源码中**为性能检测（performance measurement）所记录的数据**：按
-> "记录原语 → 各子系统/流程记录了什么 → 汇总与上报 → 调用栈 → 时序图" 组织，
+> "记录原语 ⇒ 各子系统/流程记录了什么 ⇒ 汇总与上报 ⇒ 调用栈 ⇒ 时序图" 组织，
 > 所有结论均与真实代码逐行对应（`file:line`）。
 >
 > 适用代码版本：`main`（`core/`, `common/`, `protocol/TwoPLPasha`, `protocol/Pasha` 等）。
@@ -68,7 +68,7 @@ void add(const element_type &value) {
 
 1. **预热门控**：`warmed_up == false` 时**完全不记录**。`warmed_up` 是 `core/Coordinator.h:30` 的全局变量，
    在跑过 warmup 秒后才置 `true`（`core/Coordinator.h:324-325`）。
-2. **采样率**：`uniform_dist(0,100) > 10` 则丢弃 → 仅当落在 `[0,10]` 时记录，实际采样率约 **11/101 ≈ 10.9%**
+2. **采样率**：`uniform_dist(0,100) > 10` 则丢弃 ⇒ 仅当落在 `[0,10]` 时记录，实际采样率约 **11/101 ≈ 10.9%**
    （源码注释写 "2%" 与代码不符，是陈旧注释）。这是**蓄水池式降采样**，避免 `data_` 向量无限增长。
 3. `nth(n)` 用 nearest-rank 法（`Percentile.h:57-68`），`save_cdf()` 导出 CDF 曲线（`Percentile.h:70-100`）。
 
@@ -76,14 +76,14 @@ void add(const element_type &value) {
 
 ---
 
-## 1. 记录点全景表（流程 → 指标 → 变量 → 代码位置）
+## 1. 记录点全景表（流程 ⇒ 指标 ⇒ 变量 ⇒ 代码位置）
 
 | # | 流程/子系统 | 记录的指标 | 类型 | 变量 | 写入点 | 上报点 |
 |---|---|---|---|---|---|---|
 | 1 | 事务执行循环 | 提交/中止计数 | atomic | `n_commit`,`n_abort_lock`,`n_abort_read_validation`,`n_abort_no_retry` | `core/Executor.h:157,176-199` | Coordinator 每秒 |
 | 2 | 事务执行循环 | 端到端延迟分布 | Percentile | `percentile`,`dist_latency`,`local_latency` | `core/Executor.h:168-173` | `onExit` `Executor.h:231` |
 | 3 | 事务执行循环 | commit 阶段耗时 | Percentile | `commit_latency` | `core/Executor.h:151` | `onExit` |
-| 4 | 事务内部拆解 | stall/local/remote/commit_* | ScopedTimer→Percentile | `*_txn_*_time_pct`（18 个） | 见 §3 | `onExit` `Executor.h:241-258` |
+| 4 | 事务内部拆解 | stall/local/remote/commit_* | ScopedTimer⇒Percentile | `*_txn_*_time_pct`（18 个） | 见 §3 | `onExit` `Executor.h:241-258` |
 | 5 | 网络大小 | 累计字节 | atomic | `n_network_size` | `core/Executor.h:152` | Coordinator 每秒 |
 | 6 | Pasha 访问分类 | 本地/CXL本地/远程/带请求远程 | atomic | `n_local_access`,`n_local_cxl_access`,`n_remote_access`,`n_remote_access_with_req` | `TwoPLPashaExecutor.h:96,112-114,124,161` | Coordinator 每秒 |
 | 7 | 数据迁移 | 迁入/迁出次数 | atomic | `num_data_move_in/out` | `TwoPLPashaHelper.h:1602,1814` | Coordinator 每秒 |
@@ -100,7 +100,7 @@ void add(const element_type &value) {
 
 ---
 
-## 2. 数据流总图（记录 → 聚合 → 上报）
+## 2. 数据流总图（记录 ⇒ 聚合 ⇒ 上报）
 
 ```mermaid
 flowchart TB
@@ -227,22 +227,22 @@ if (smeta->is_bit_set(cur_host_bit_index) == false) {
 ```mermaid
 sequenceDiagram
     autonumber
-    participant Loop as Executor::start 主循环<br/>(core/Executor.h)
+    participant Exec as Executor::start 主循环<br/>(core/Executor.h)
     participant Txn as TwoPLPashaTransaction
     participant Proto as TwoPLPasha::commit
     participant Log as WALLogger
     participant W as Worker 原子计数
     participant Pct as Percentile 采样器
 
-    Loop->>Txn: transaction->execute(id)  (:132)
+    Exec->>Txn: transaction->execute(id)  (:132)
     activate Txn
-    Note over Txn: ScopedTimer t_local_work (:356)<br/>→ record_local_work_time
-    Note over Txn: ScopedTimer t_remote_work (:465)<br/>→ record_remote_work_time
-    Txn-->>Loop: READY_TO_COMMIT
+    Note over Txn: ScopedTimer t_local_work (:356)<br/>⇒ record_local_work_time
+    Note over Txn: ScopedTimer t_remote_work (:465)<br/>⇒ record_remote_work_time
+    Txn-->>Exec: READY_TO_COMMIT
     deactivate Txn
 
-    Note over Loop: ScopedTimer t (:136)<br/>→ record_commit_work_time / set_stall_time
-    Loop->>Proto: protocol.commit(txn, messages)  (:146)
+    Note over Exec: ScopedTimer t (:136)<br/>⇒ record_commit_work_time / set_stall_time
+    Exec->>Proto: protocol.commit(txn, messages)  (:146)
     activate Proto
     Note over Proto: ScopedTimer (:351) record_commit_prepare_time
     Note over Proto: ScopedTimer (:363) record_local_work_time
@@ -250,21 +250,21 @@ sequenceDiagram
     Note over Proto: ScopedTimer (:371) record_commit_persistence_time
     Note over Proto: ScopedTimer (:524) record_commit_write_back_time
     Note over Proto: ScopedTimer (:531) record_commit_unlock_time
-    Proto-->>Loop: commit = true/false
+    Proto-->>Exec: commit = true/false
     deactivate Proto
 
-    Loop->>Pct: commit_latency.add(ltc)  (:151)
-    Loop->>W: n_network_size += txn.network_size  (:152)
+    Exec->>Pct: commit_latency.add(ltc)  (:151)
+    Exec->>W: n_network_size += txn.network_size  (:152)
 
     alt commit 成功
-        Loop->>W: n_commit++ (:157)  db.global_total_commit++ (:155)
-        Loop->>Pct: percentile.add(latency) (:168)<br/>dist/local_latency.add() (:169-173)
-        Loop->>Pct: record_txn_breakdown_stats(txn) (:174)<br/>→ 18 个 *_txn_*_time_pct.add()
+        Exec->>W: n_commit++ (:157)  db.global_total_commit++ (:155)
+        Exec->>Pct: percentile.add(latency) (:168)<br/>dist/local_latency.add() (:169-173)
+        Exec->>Pct: record_txn_breakdown_stats(txn) (:174)<br/>⇒ 18 个 *_txn_*_time_pct.add()
     else commit 失败
-        Loop->>W: n_abort_lock++ / n_abort_read_validation++ (:176-181)
+        Exec->>W: n_abort_lock++ / n_abort_read_validation++ (:176-181)
     end
 
-    Note over Loop,Pct: 线程退出 onExit (:229)<br/>打印 50/75/95/99% + LOCAL/DIST 9 段平均
+    Note over Exec,Pct: 线程退出 onExit (:229)<br/>打印 50/75/95/99% + LOCAL/DIST 9 段平均
 ```
 
 ### 7.2 Pasha 数据访问分类（本地 / 远程 / 迁移）
@@ -381,7 +381,7 @@ sequenceDiagram
     loop coordinator_num - 1 次 (:558)
         N0->>N0: in_queue.wait_till_non_empty() (:559)
         N0->>Dec: 解出 r_commit + 6 类 usage (:573)
-        N0->>N0: commit += r_commit; usage += r_usage (:581-588)
+        N0->>N0: commit 与 usage 分别累加 r_commit 与 r_usage (:581-588)
     end
 
     N0->>Log: "Global Stats: total_commit ... total_usage" (:610)
@@ -438,7 +438,7 @@ sequenceDiagram
     rect rgb(255,245,235)
     Note over Help,Cnt: 写路径 finish_write (:59)
     Help->>SCC: finish_write(scc_meta, host_id, data, size)
-    SCC->>Meta: clear_all_scc_bits(); set_scc_bit(host_id) (:68-69)
+    SCC->>Meta: clear_all_scc_bits 后 set_scc_bit host_id (:68-69)
     SCC->>HW: clwb(data) (:71) ⇒ num_clwb++ (:71)
     end
 
@@ -458,9 +458,9 @@ sequenceDiagram
     loop 每 1 秒, 共 time_to_run 次 (:236-341)
         Co->>Co: sleep_for(1s) (:237)
         loop for each worker (:249)
-            Co->>Wk: n_xxx += w->n_xxx.load(); w->n_xxx.store(0) (:262-299)
+            Co->>Wk: 累加 w 的 n_xxx.load 后 store 0 清零 (:262-299)
         end
-        Co->>Co: n_data_move_in/out += 全局; 清零 (:302-305)
+        Co->>Co: n_data_move_in 和 out 累加全局后清零 (:302-305)
         Co->>Co: LOG "commit:.. abort:.. access:.. move:.." 每秒一行 (:307-322)
         alt count > warmup 且 <= timeToRun
             Co->>G: warmed_up = true (:325)
