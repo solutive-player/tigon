@@ -14,6 +14,7 @@
 - [1. 记录点全景表](#1-记录点全景表流程--指标--变量--代码位置)
 - [2. 数据流总图](#2-数据流总图记录--聚合--上报)
 - [3. 事务内部 9 段时间拆解](#3-事务内部-9-段时间拆解)
+  - [3.1 `ScopedTimer` 实现原理详解](#31-scopedtimer-实现原理详解)
 - [4. Pasha 数据访问分类与迁移计数](#4-pasha-数据访问分类与迁移计数)
 - [5. CXL 内存占用（6 类）](#5-cxl-内存占用6-类--硬件一致性预算)
 - [6. 软件缓存一致性命中率（SCC）](#6-软件缓存一致性命中率scc)
@@ -158,6 +159,163 @@ flowchart TB
 > 单分区与分布式事务**分两套** Percentile 记录（`local_txn_*_pct` 9 个 + `dist_txn_*_pct` 9 个，
 > `Executor.h:390-395`），由 `record_txn_breakdown_stats()`（`Executor.h:406-429`）按
 > `txn.is_single_partition()` 分流。这正是 Tigon 论文分析多分区事务代价构成的核心数据。
+
+### 3.1 `ScopedTimer` 实现原理详解
+
+§3 的全部 9 段拆解都建立在 `ScopedTimer` 这一个 30 行的小类之上（`common/Time.h:23-52`）。
+它是 Tigon 时间测量的**核心机制**，本质是把 C++ 的 **RAII（Resource Acquisition Is Initialization）**
+语义借用来做"作用域计时"：构造时记起点、析构时算耗时并回调。
+
+#### 3.1.1 完整源码
+
+```cpp
+// common/Time.h:23-52
+class ScopedTimer {
+    public:
+	ScopedTimer(std::function<void(uint64_t)> f)
+		: call_on_destructor(f)               // ① 保存回调
+	{
+		startTime = std::chrono::steady_clock::now();  // ② 构造即打点(起点)
+	}
+
+	void reset()                                  // 复用: 重新计时
+	{
+		startTime = std::chrono::steady_clock::now();
+		ended = false;
+	}
+	void end()                                    // ③ 计算耗时并回调
+	{
+		auto us = std::chrono::duration_cast<std::chrono::microseconds>(
+				std::chrono::steady_clock::now() - startTime).count();
+		call_on_destructor(us);               // 把 μs 交给回调
+		ended = true;                         // 标记已结束, 防重复
+	}
+
+	~ScopedTimer()                                // ④ 析构兜底
+	{
+		if (!ended) {
+			end();
+		}
+	}
+	bool ended = false;
+	std::chrono::steady_clock::time_point startTime;
+	std::function<void(uint64_t)> call_on_destructor;
+};
+```
+
+#### 3.1.2 四个设计要素逐一拆解
+
+**① 构造即起点（`Time.h:28`）**
+构造函数体内立刻调用 `steady_clock::now()` 写入 `startTime`。这意味着"计时起点 = 对象创建的那一行"，
+因此调用方只要在想测量的代码块**开头**定义一个 `ScopedTimer` 局部变量即可，无需显式 start。
+
+**② 析构即终点（`Time.h:43-48`）—— RAII 的精髓**
+C++ 保证**栈上局部对象在离开作用域时自动析构**（包括正常 return、`break`、异常抛出等所有退出路径）。
+`~ScopedTimer()` 中调用 `end()`，于是"计时终点 = 作用域结束的花括号 `}`"。
+这把"必须手动配对 start/stop"的易错模式，转化为编译器强制保证的自动配对——**绝不会漏掉 stop**，
+即便中途 `return` 或抛异常也照样记录。
+
+**③ 回调注入 + 类型擦除（`Time.h:25,51`）**
+`std::function<void(uint64_t)>` 把"耗时算出来之后干什么"完全外置给调用方。`ScopedTimer` 自己
+**不知道也不关心**这个数字最终写到哪个字段——它只负责"测量 + 回调"。这就是它能服务全部 9 个阶段
+（`record_commit_prepare_time` / `record_local_work_time` / …）的原因：同一个类，注入不同 lambda。
+代价是 `std::function` 带来的**类型擦除开销**（可能堆分配 + 一次间接调用），见 §3.1.5。
+
+**④ `ended` 幂等标志（`Time.h:36-49`）—— 防双重计数**
+`end()` 结束后置 `ended = true`；析构时 `if (!ended)` 才再调一次。这保证：
+- 若调用方**显式调用了 `end()`**（想在作用域结束**前**就定格耗时），析构时不会再记一遍；
+- 若调用方**没调** `end()`，则由析构兜底记一次。
+两种用法都恰好记录**一次**，避免重复累加污染统计。
+
+#### 3.1.3 时钟选择：为什么是 `steady_clock`
+
+`ScopedTimer` 与 `Time::now()`（`Time.h:14-18`）都用 `std::chrono::steady_clock` 而非
+`system_clock`。原因是 `steady_clock` 是**单调时钟**——不受 NTP 校时、用户改系统时间、闰秒影响，
+保证 `now() - startTime` 永远非负且代表真实流逝时长。这对延迟测量是必须的。
+末尾 `duration_cast<microseconds>` 做**截断取整**（非四舍五入），亚微秒部分被丢弃，
+所以单次极短操作可能记成 `0 μs`——在大量采样的统计语境下可接受。
+
+#### 3.1.4 关键用法：一个计时器、两种回调（commit vs abort）
+
+`ScopedTimer` 最精彩的用法在 `core/Executor.h:136-145`——**用闭包按运行时分支选择记录目标**：
+
+```cpp
+// core/Executor.h:135-147
+bool commit;
+{
+    ScopedTimer t([&, this](uint64_t us) {     // 闭包按引用捕获 commit
+        if (commit) {
+            this->transaction->record_commit_work_time(us);   // 成功 ⇒ 记"提交工作耗时"
+        } else {
+            auto ltc = ... steady_clock::now() - transaction->startTime ...;
+            this->transaction->set_stall_time(ltc);            // 失败 ⇒ 记"冲突 stall 耗时"
+        }
+    });
+    commit = protocol.commit(*transaction, messages);   // ← 真正被计时的工作
+}   // ← 花括号在此结束 ⇒ t 析构 ⇒ end() ⇒ 此刻才读 commit 的最终值
+```
+
+**精妙之处**：lambda **按引用捕获** `commit`，而 `commit` 的赋值发生在计时块内部
+（`commit = protocol.commit(...)`）。由于回调在**析构时（花括号 `}`）**才执行，那时 `commit`
+已经拿到最终结果，于是同一个计时器自动把耗时分流到 `record_commit_work_time`（成功）
+或 `set_stall_time`（失败）。这是 RAII "延迟到作用域末尾执行" 语义的直接利用。
+
+> ⚠️ 这也是一个**生命周期陷阱**：回调按引用捕获的对象（这里是 `commit`、`this->transaction`）
+> 必须在 `ScopedTimer` 析构那一刻仍然有效。代码用一个内层 `{ }` 作用域把 `ScopedTimer` 的生命周期
+> 限制得比 `commit` 更短，从而保证安全。
+
+#### 3.1.5 累加语义 vs 采样语义（与 §0 两类原语的衔接）
+
+注意区分**两层记录**：
+
+1. `ScopedTimer` 的回调（`record_*_time`）写入的是 `TwoPLPashaTransaction` 的
+   `*_time_us` 成员，用的是 **`+=` 累加**（`TwoPLPashaTransaction.h:56-58` 等）。
+   因此同一事务内**多次**进入同一阶段（如 `record_local_work_time` 在 `:356` 与 `:363` 被调用两次）
+   会**累计**到同一字段——衡量的是"该事务在该阶段花的总时间"。
+2. 事务提交后，`record_txn_breakdown_stats()`（`Executor.h:406-429`）才把这些**单事务累计值**
+   `.add()` 进 `Percentile`——此处才受 §0.2 的**预热门控 + ~10% 采样**约束。
+
+即：**ScopedTimer→`+=` 是无条件、每事务的精确累加；Percentile 是有门控、降采样的跨事务分布**。
+两者串联，既保证单事务拆解准确，又控制全局内存与开销。
+
+#### 3.1.6 生命周期时序图
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant Caller as 调用方代码块
+    participant ST as ScopedTimer 对象
+    participant Clock as steady_clock
+    participant CB as 注入的 lambda 回调
+    participant Field as transaction 的 _time_us 字段
+
+    Caller->>ST: 构造 ScopedTimer(lambda) (Time.h:25)
+    ST->>Clock: startTime = now() (Time.h:28)
+    Note over Caller: 执行被测量的工作<br/>(protocol.commit 等)
+
+    alt 调用方显式 end()
+        Caller->>ST: end() (Time.h:36)
+        ST->>Clock: us = now() - startTime (Time.h:38)
+        ST->>CB: call_on_destructor(us) (Time.h:39)
+        CB->>Field: record_xxx_time(us) 累加 += (Time.h)
+        ST->>ST: ended = true (Time.h:40)
+        Caller->>ST: 作用域结束 析构 (Time.h:43)
+        Note over ST: if(!ended) 为假 ⇒ 不重复记录
+    else 依赖析构兜底 默认路径
+        Caller->>ST: 作用域结束 花括号 析构 (Time.h:43)
+        ST->>ST: if(!ended) 为真 (Time.h:45)
+        ST->>Clock: us = now() - startTime (Time.h:38)
+        ST->>CB: call_on_destructor(us) (Time.h:39)
+        CB->>Field: record_xxx_time(us) 累加 +=
+    end
+```
+
+#### 3.1.7 与 `Time::now()` 的分工
+
+同文件的 `Time::now()`（`Time.h:12-21`）返回相对**全局 `startTime`** 的纳秒数，用于需要
+**绝对时间戳**的场景（如消息 `gen_time` / `send_time`、`last_sync_time`、WAL 的
+`txn_start_times`）。而 `ScopedTimer` 用于**相对区间计时**。两者都基于 `steady_clock`，
+但 `ScopedTimer` 自带 RAII 自动收尾，`Time::now()` 则是裸时间戳、由调用方自行相减。
 
 ---
 
