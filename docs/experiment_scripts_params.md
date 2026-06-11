@@ -73,7 +73,7 @@ mixed 60 90   ← 最后一档：60% NewOrder + 90% Payment 为远程
 tpcc-<PROTOCOL>-<HOST>-<WORKER>-<CXL>-<OUTPUT>-<MIGPOL>-<WHEN>-<BUDGET>-<SCC>-<SCCMECH>-<PREMIG>-<LOG>-<EPOCH>-<MODEL>.txt
 ycsb-<PROTOCOL>-<WORKLOAD>-<HOST>-<WORKER>-<RW>-<ZIPF>-<CXL>-<OUTPUT>-<MIGPOL>-<WHEN>-<BUDGET>-<SCC>-<SCCMECH>-<PREMIG>-<LOG>-<EPOCH>-<MODEL>.txt
 ```
-**这套命名是 run 脚本与 parse 脚本之间的"契约"**——parse_swcc.py 正是靠拼出同样的名字来读对文件（见 §4）。
+**这套命名是 run 脚本与 parse 脚本之间的"契约"**——parse_swcc.py 正是靠拼出同样的名字来读对文件（见 §5）。
 
 ---
 
@@ -226,7 +226,60 @@ ycsb-<PROTOCOL>-<WORKLOAD>-<HOST>-<WORKER>-<RW>-<ZIPF>-<CXL>-<OUTPUT>-<MIGPOL>-<
 
 ---
 
-## 4. `./scripts/parse/parse_swcc.py $RESULT_ROOT_DIR`（把 SWcc 实验 .txt 解析成 Fig 8 的 .csv）
+## 4. `./scripts/run_swcc.sh $RESULT_ROOT_DIR`（生成 Fig 8 数据）
+
+研究「不同**软件缓存一致（SCC）机制**对性能的影响」，所以**只跑 Tigon（TwoPLPasha），扫 SCC 机制这一维**——其余配置全部锁定为 Tigon 默认值，只切换 `<ENABLE_SCC>-<SCC_MECHANISM>-<PRE_MIGRATE>` 三段。它产出的 8 个 `.txt` 正是 §5 的 `parse_swcc.py` 要读的输入。
+
+### 4.1 顶部配置常量（run_swcc.sh:24-48）
+
+| 变量 | 值 | 含义 |
+|---|---|---|
+| `HOST_NUM` / `WORKER_NUM` / `OLD_WORKER_NUM` | 8 / 3 / 2 | 同其它脚本（OLD_WORKER_NUM 本脚本未用到） |
+| `DEFAULT_WAL_GROUP_COMMIT_TIME` | `10000` | 组提交 epoch = 10000µs = **10ms** |
+| `DEFAULT_HCC_SIZE_LIMIT` | `1024*1024*200` = `209715200` | HW-cc 区预算 = **200MB**（本脚本实际用的预算） |
+| `DATA_MOVEMENT_EXP_HCC_SIZE_LIMIT_1..5` | 200/150/100/50/10 MB | 5 档预算常量（从 run_hwcc_budget.sh 模板复制残留，**本脚本未使用**） |
+| `TPCC_RUN_TIME` / `TPCC_WARMUP_TIME` | `30` / `10` | TPC-C 运行 30s / 预热 10s |
+| `YCSB_RUN_TIME` / `YCSB_WARMUP_TIME` | `30` / `10` | YCSB 运行 30s / 预热 10s |
+| `READ_INTENSIVE_RW_RATIO` | `95` | YCSB 读密集 = 95% 读 |
+| `WRITE_INTENSIVE_RW_RATIO` | `50` | 写密集（**本脚本未用**，只跑读密集） |
+| `RESULT_DIR` | `$RESULT_ROOT_DIR/swcc` | 结果落 `<root>/swcc/` |
+
+> `DATA_MOVEMENT_EXP_HCC_SIZE_LIMIT_*` 与 `WRITE_INTENSIVE_RW_RATIO` 是模板复制带来的「声明但未引用」常量——SWcc 实验固定用 200MB 预算、只测读密集，不扫预算、不测写密集。
+
+### 4.2 八次实验调用（run_swcc.sh:58-68）逐参数
+
+4 种 SCC 机制 × {TPC-C, YCSB 读密集} = 8 行。除 `<ENABLE_SCC>-<SCC_MECHANISM>-<PRE_MIGRATE>` 三段外，所有参数对 8 行完全一致（host/worker=8/3、CXL/输出=1/0、迁移=Clock、迁出=OnDemand、预算=200MB、日志=GROUP_WAL/10000、model=0、run/warmup=30/10）。
+
+**TPC-C 部分（58-61）**，每行 = `run_remote_txn_overhead_tpcc`（17 参）：
+
+| # | 论文含义 | 协议 | **ENABLE_SCC** | **SCC_MECHANISM** | **PRE_MIGRATE** | 其余 |
+|---|---|---|---|---|---|---|
+| 58 | Tigon（默认） | TwoPLPasha | `1` | `WriteThrough` | `NonPart` | 8/3·1/0·Clock·OnDemand·200MB·GROUP_WAL/10000·model0·30/10 |
+| 59 | Tigon + 无共享读者 | TwoPLPasha | `1` | `WriteThroughNoSharedRead` | `NonPart` | 同上 |
+| 60 | Tigon + 非时序 | TwoPLPasha | `1` | `NonTemporal` | `NonPart` | 同上 |
+| 61 | Tigon + 关 SCC | TwoPLPasha | **`0`** | `NoOP` | **`None`** | 同上 |
+
+**YCSB 读密集部分（65-68）**，每行 = `run_remote_txn_overhead_ycsb`（20 参），固定 `WORKLOAD=rmw`、`RW_RATIO=95`、`ZIPF=0.7`，SCC 三段同样切 4 种，run/warmup=30/10。
+
+**SCC 机制（第 10/11 参 = ENABLE_SCC / SCC_MECHANISM）四种取值的语义**（对照 `--scc_mechanism`，README:202、`protocol/Pasha/SCCManager`）：
+
+- **`1` + `WriteThrough`**（Tigon 默认）：软件缓存一致开启，写穿透机制——读 miss 时 `clflush` 后置 per-host 有效位，写时清所有 host 的有效位并 `clwb` 刷回 CXL，且**允许共享读者**（多 host 同时持有效副本）。这是 Tigon 兜底 CXL 1.1 硬件缓存一致预算有限的核心机制。
+- **`1` + `WriteThroughNoSharedRead`**：同样写穿透，但**禁用共享读者优化**——用来量化「允许多 host 同时缓存只读副本」带来的收益（关掉它性能应下降）。
+- **`1` + `NonTemporal`**：始终用非时序（non-temporal）访问 CXL，绕过 CPU cache 直接读写——避免维护一致性位的开销，但每次都走内存、无 cache 局部性收益。对照实验。
+- **`0` + `NoOP`**：完全关闭软件缓存一致（`enable_scc=0`），`NoOP` 机制不做任何一致性维护——**假设底层硬件已提供完整缓存一致**。这是「无 SWcc」对照基准，衡量 SCC 本身的开销。
+
+**为什么 NoOP 那行配 `PRE_MIGRATE=None` 而非 NonPart？**（59-61 是 NonPart，61 是 None）
+
+- 前三种（WriteThrough 系 + NonTemporal）都开 SCC，配合 `NonPart` 预迁移「不可分区数据」，与 Tigon 主实验一致。
+- `NoOP` 关闭了缓存一致，迁移行的一致性维护机制也随之失效，故配套关闭预迁移（`None`），避免迁移与无一致性机制冲突——这也是 `parse_swcc.py` 里 NoOP 文件名后缀是 `0-NoOP-None`、其余是 `1-<机制>-NonPart` 的原因（见 §5.2）。
+
+> 每行内部仍扫远程比例（TPC-C 7 档、YCSB 11 档，由 `common.sh` 循环）。Fig 8 横轴即远程比例，4 条曲线 = 4 种 SCC 机制。
+>
+> 总实验数：(4 机制 × 7 远程比例) [TPCC] + (4 × 11) [YCSB] = 28 + 44 = **72 次**启动 ≈ 72×40s ≈ 48 分钟 + 开销 ≈ 1 小时（README:153）。
+
+---
+
+## 5. `./scripts/parse/parse_swcc.py $RESULT_ROOT_DIR`（把 SWcc 实验 .txt 解析成 Fig 8 的 .csv）
 
 > 前提：`parse_swcc.py` 解析的是 `run_swcc.sh` 产出的文件。`run_swcc.sh`（结构同上述 run 脚本）对 **4 种软件缓存一致机制**各跑一遍 TPC-C + YCSB 读密集（`run_swcc.sh:58-68`）：
 > - `WriteThrough`（Tigon 默认，SCC 开）
@@ -236,7 +289,7 @@ ycsb-<PROTOCOL>-<WORKLOAD>-<HOST>-<WORKER>-<RW>-<ZIPF>-<CXL>-<OUTPUT>-<MIGPOL>-<
 >
 > 这 4 个机制对应文件名里 `<SCC>-<SCCMECH>-<PREMIG>` 三段的不同取值。
 
-### 4.1 顶层执行（parse_swcc.py:40-48）
+### 5.1 顶层执行（parse_swcc.py:40-48）
 
 ```python
 if len(sys.argv) != 2:                                  # 必须恰好 1 个命令行参数
@@ -251,7 +304,7 @@ parse_ycsb_swcc(swcc_res_dir, "95", "0.7")             # 解析 YCSB 读密集(9
 - `sys.argv[1]` = 跟 run 脚本同一个 `RESULT_ROOT_DIR`。
 - `parse_ycsb_swcc` 的两个字面量参数 `"95"`、`"0.7"`：**必须和 `run_swcc.sh` 里 YCSB 跑的 `READ_INTENSIVE_RW_RATIO=95`、`ZIPF=0.7` 完全一致**，否则拼出的文件名对不上、读不到数据。
 
-### 4.2 构造 TPC-C 输入文件清单（parse_swcc.py:25-31）
+### 5.2 构造 TPC-C 输入文件清单（parse_swcc.py:25-31）
 
 ```python
 def construct_input_list_tpcc_swcc(swcc_res_dir):
@@ -278,7 +331,7 @@ def construct_input_list_tpcc_swcc(swcc_res_dir):
 
 可见 4 行只有 `<SCC>-<SCC机制>-<预迁移>` 三段不同，**精确对应 `run_swcc.sh:58-61` 跑出的 4 个文件**（前三者 SCC 开+NonPart，最后 NoOP 时 SCC 关+预迁移 None——因为关了缓存一致，配套也不预迁移）。`209715200`=200MB、`10000`=10ms epoch、`8-3`=8host×3worker 全部硬编码进路径，必须和 run_swcc.sh 的常量一致。
 
-### 4.3 解析 TPC-C 并写 CSV（parse_swcc.py:33-37）
+### 5.3 解析 TPC-C 并写 CSV（parse_swcc.py:33-37）
 
 ```python
 def parse_tpcc_swcc(swcc_res_dir):
@@ -290,7 +343,7 @@ def parse_tpcc_swcc(swcc_res_dir):
 
 - `header_row` 第 1 列是行标签列名 `Remote_Ratio`，后 7 列正是 TPC-C 的 7 档 NewOrder/Payment 远程比例——**顺序必须和 `common.sh` 里 7 次调用的顺序（0/0,10/15,…,60/90）一致**，因为吞吐值就是按这个顺序追加进 .txt 的。
 
-### 4.4 YCSB 版（parse_swcc.py:11-23）
+### 5.4 YCSB 版（parse_swcc.py:11-23）
 
 ```python
 def construct_input_list_ycsb_swcc(swcc_res_dir, rw_ratio, zipf_theta):
@@ -309,7 +362,7 @@ def parse_ycsb_swcc(swcc_res_dir, rw_ratio, zipf_theta):
 
 `rw_ratio`/`zipf_theta` 由主程序传入 `"95"`/`"0.7"`，既用于**拼输入文件名**（要对上 run_swcc.sh），又用于**命名输出 CSV**。header 是 YCSB 的 11 档跨分区比例 0→100。
 
-### 4.5 解析引擎（parse/common.py）—— 数值是怎么抓出来的
+### 5.5 解析引擎（parse/common.py）—— 数值是怎么抓出来的
 
 ```python
 def get_row(input):                         # input = (标签, 文件路径)
@@ -358,7 +411,7 @@ def append_motor_numbers(output_file_name, motor_csv_name):   # parse_swcc.py �
 ```
 > 注意：**SWcc 实验不含 Motor 基线**（Motor 没有软件缓存一致这个维度），所以 `parse_swcc.py` 不调用 `append_motor_numbers`——这也是它和 `parse_tpcc.py`/`parse_ycsb.py` 的唯一流程差异。
 
-### 4.6 parse_swcc.py 端到端数据流
+### 5.6 parse_swcc.py 端到端数据流
 
 ```
 run_swcc.sh 跑出 8 个 .txt(TPCC 4机制 + YCSB 4机制)，每个 .txt 含多档远程比例的 Global Stats 行
@@ -374,18 +427,19 @@ plot_swcc.py → swcc.pdf (论文 Figure 8：4 种 SCC 机制吞吐对比)
 
 ---
 
-## 5. 四脚本横向对比速览
+## 6. 五脚本横向对比速览
 
-| 维度 | run_tpcc.sh | run_ycsb.sh | run_hwcc_budget.sh | parse_swcc.py（对应 run_swcc.sh） |
-|---|---|---|---|---|
-| 目标图 | Fig 4(a/b/c) | Fig 5 | Fig 7 | Fig 8 |
-| 扫描维度 | 协议×传输方式(8 配置) | 读写比(4)×系统(3) | **HW-cc 预算(5 档)** | **SCC 机制(4)** |
-| 协议 | TwoPL/Sundial/TwoPLPasha(+Phantom) | TwoPL/Sundial/TwoPLPasha | 仅 TwoPLPasha | 仅 TwoPLPasha |
-| 预算 | 基线0 / Tigon 200MB | 基线0 / Tigon 200MB | **200/150/100/50/10MB** | 200MB |
-| SCC | 基线NoOP / Tigon WriteThrough | 同左 | WriteThrough | **WriteThrough/NoSharedRead/NonTemporal/NoOP** |
-| 预迁移 | Tigon NonPart | Tigon NonPart | **None** | NonPart(NoOP 时 None) |
-| run/warmup | 30/10 | 30/10 | **120/60(TPCC), 60/30(YCSB)** | 30/10 |
-| 远程维度 | NewOrder/Payment 7 档 | CROSS_RATIO 11 档 | 同各自 benchmark | 同各自 benchmark |
-| 单点数 | 56 | 132 | 90 | 由 run_swcc.sh 产出，parse 只读 |
+| 维度 | run_tpcc.sh | run_ycsb.sh | run_hwcc_budget.sh | run_swcc.sh | parse_swcc.py |
+|---|---|---|---|---|---|
+| 目标图 | Fig 4(a/b/c) | Fig 5 | Fig 7 | Fig 8 | （解析 Fig 8 数据） |
+| 扫描维度 | 协议×传输方式(8 配置) | 读写比(4)×系统(3) | **HW-cc 预算(5 档)** | **SCC 机制(4)** | — |
+| 协议 | TwoPL/Sundial/TwoPLPasha(+Phantom) | TwoPL/Sundial/TwoPLPasha | 仅 TwoPLPasha | 仅 TwoPLPasha | — |
+| 预算 | 基线0 / Tigon 200MB | 基线0 / Tigon 200MB | **200/150/100/50/10MB** | 200MB | — |
+| SCC | 基线NoOP / Tigon WriteThrough | 同左 | WriteThrough | **WriteThrough/NoSharedRead/NonTemporal/NoOP** | — |
+| 预迁移 | Tigon NonPart | Tigon NonPart | **None** | NonPart（NoOP 时 None） | — |
+| run/warmup | 30/10 | 30/10 | **120/60(TPCC), 60/30(YCSB)** | 30/10 | — |
+| 负载 | TPC-C mixed | YCSB rmw(4 读写比) | TPC-C + YCSB 读密集 | TPC-C + YCSB 读密集 | — |
+| 远程维度 | NewOrder/Payment 7 档 | CROSS_RATIO 11 档 | 同各自 benchmark | 同各自 benchmark | — |
+| 单点数 | 56 | 132 | 90 | **72** | 读 8 个 .txt |
 
-**贯穿四者的不变量**：`HOST_NUM=8`、`WORKER_NUM=3`、`EPOCH=10000µs`、`LOGGING=GROUP_WAL`、`WHEN_TO_MOVE_OUT=OnDemand`、`MIGRATION_POLICY=Clock`（Tigon）、`MODEL_CXL_SEARCH=0`、`GATHER_OUTPUTS=0`、`QUERY=mixed`(TPCC)/`rmw`(YCSB)、`KEYS=300000`(YCSB)。每个实验「只动一个旋钮」正是论文做受控变量对比的方法论。
+**贯穿五者的不变量**：`HOST_NUM=8`、`WORKER_NUM=3`、`EPOCH=10000µs`、`LOGGING=GROUP_WAL`、`WHEN_TO_MOVE_OUT=OnDemand`、`MIGRATION_POLICY=Clock`（Tigon）、`MODEL_CXL_SEARCH=0`、`GATHER_OUTPUTS=0`、`QUERY=mixed`(TPCC)/`rmw`(YCSB)、`KEYS=300000`(YCSB)。每个实验「只动一个旋钮」正是论文做受控变量对比的方法论——`run_swcc.sh` 锁死预算/迁移/负载，唯独切换 SCC 机制，正是这一方法论最纯粹的体现。

@@ -6,7 +6,7 @@
 > - `scripts/plot/plot_tpcc_twopl.py` — Fig 4(b)：DS2PL(TwoPL) 三变体
 > - `scripts/plot/plot_tpcc.py` — Fig 4(c)：Tigon vs Sundial+/DS2PL+/Motor
 >
-> 数据来源 = `run_tpcc.sh` 跑出的 8 个 `.txt`（见 `docs/experiment_scripts_params.md` §1）。解析引擎 `get_row/parse_results/append_motor_numbers` 定义在 `scripts/parse/common.py`（见 `docs/experiment_scripts_params.md` §4.5）。
+> 数据来源 = `run_tpcc.sh` 跑出的 8 个 `.txt`（见 `docs/experiment_scripts_params.md` §1）。解析引擎 `get_row/parse_results/append_motor_numbers` 定义在 `scripts/parse/common.py`（见 `docs/experiment_scripts_params.md` §5.5）。
 
 ---
 
@@ -327,7 +327,7 @@ plt.savefig(res_root_dir + "/tpcc/tpcc.pdf", format="pdf", bbox_inches="tight")
 
 ## 5. 回顾解析引擎 `common.py`（数值如何变成曲线）
 
-三张图的 Y 值最终都源自 `get_row` 从日志里抓的一个数。再次明确（详见 `docs/experiment_scripts_params.md` §4.5）：
+三张图的 Y 值最终都源自 `get_row` 从日志里抓的一个数。再次明确（详见 `docs/experiment_scripts_params.md` §5.5）：
 
 ```python
 def get_row(input):                              # input = (标签, .txt 路径)
