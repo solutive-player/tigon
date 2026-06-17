@@ -11,6 +11,7 @@
 ## 目录
 
 - [0. 记录原语：两类容器](#0-记录原语两类容器)
+  - [0.2 分布采样器 `Percentile<T>` 详解](#02-分布采样器-percentilet延迟--分布类)
 - [1. 记录点全景表](#1-记录点全景表流程--指标--变量--代码位置)
 - [2. 数据流总图](#2-数据流总图记录--聚合--上报)
 - [3. 事务内部 9 段时间拆解](#3-事务内部-9-段时间拆解)
@@ -52,28 +53,165 @@ std::atomic<uint64_t> n_local_access{0}, n_local_cxl_access{0}, n_remote_access{
 
 ### 0.2 分布采样器 `Percentile<T>`（延迟 / 分布类）
 
-`common/Percentile.h` —— 最关键、也最易误读的一段：
+`common/Percentile.h`（仅 117 行）是 Tigon 所有"延迟分布 / 百分位"统计的唯一实现。它是一个
+**模板类** `template <class T> class Percentile`，`T` 即被统计量的类型（多为 `uint64_t` 微秒、
+`int64_t` 微秒或字节数）。下面逐成员剖析。
+
+#### 0.2.1 数据结构（4 个成员）
+
+```cpp
+// common/Percentile.h:111-115
+Random rand;                      // 每实例自带的伪随机数发生器(降采样用)
+bool isSorted_ = true;            // 惰性排序标志: data_ 是否已有序
+std::vector<element_type> data_;  // 保存所有被采样到的原始样本
+element_type sum = 0;             // 被采样样本的累加和(给 avg 用)
+```
+
+要点：
+- **每个 `Percentile` 实例独立持有一个 `data_` 向量**——它就是一个"样本蓄水池"，把每次 `add()`
+  进来的原始值**原封不动地存下来**（不是直方图、不是滑动窗口），所以百分位是**精确**算的，
+  代价是内存随样本数线性增长。
+- `rand` 用 `this` 指针做种子（`Percentile.h:21-24`），保证不同实例的采样序列彼此独立。
+
+#### 0.2.2 `add(value)`：实例如何"统计"一个样本
+
+这是"使用时实例怎么统计"的核心——每记录一个延迟值都走这里：
 
 ```cpp
 // common/Percentile.h:26-33
 void add(const element_type &value) {
     if (warmed_up == false || rand.uniform_dist(0, 100) > 10) // record 2% of the data
-        return;
-    isSorted_ = false;
-    data_.push_back(value);
-    sum += value;
+        return;                       // ① 门控 + 降采样: 大多数样本被直接丢弃
+    isSorted_ = false;                // ② 新样本入池 ⇒ 标记"需重新排序"
+    data_.push_back(value);           // ③ 原始值压入蓄水池
+    sum += value;                     // ④ 同步累加到 sum(给 avg 用)
 }
 ```
 
-**关键设计点：**
+**① 两道闸门**（决定一个样本是否被统计）：
+- **预热门控** `warmed_up == false`：实验未过 warmup 阶段时**全部丢弃**。`warmed_up` 是
+  `core/Coordinator.h:30` 的全局变量，跑过 warmup 秒后才置 `true`（`Coordinator.h:324-325`）。
+  ⇒ 统计只覆盖**稳态**，排除冷启动/缓存预热的噪声。
+- **伯努利随机降采样** `rand.uniform_dist(0,100) > 10`：`uniform_dist(0,100)` 返回
+  `next() % 101`，即 `[0,100]` 间共 **101** 个等概整数；`> 10` 则丢弃，仅当落在 `[0,10]`
+  （11 个值）时保留 ⇒ 实际采样率 = **11/101 ≈ 10.9%**。
+  > 源码注释写 "record 2% of the data" 与代码**不符**（陈旧注释，实际约 10.9%）。
+  > 另外这是**伯努利采样**（每个样本独立以 ~10.9% 概率保留），**不是**蓄水池抽样——
+  > 它并不限定 `data_` 的上限大小，只是把增长速度降到约 1/9，仍随时间线性增长。
 
-1. **预热门控**：`warmed_up == false` 时**完全不记录**。`warmed_up` 是 `core/Coordinator.h:30` 的全局变量，
-   在跑过 warmup 秒后才置 `true`（`core/Coordinator.h:324-325`）。
-2. **采样率**：`uniform_dist(0,100) > 10` 则丢弃 ⇒ 仅当落在 `[0,10]` 时记录，实际采样率约 **11/101 ≈ 10.9%**
-   （源码注释写 "2%" 与代码不符，是陈旧注释）。这是**蓄水池式降采样**，避免 `data_` 向量无限增长。
-3. `nth(n)` 用 nearest-rank 法（`Percentile.h:57-68`），`save_cdf()` 导出 CDF 曲线（`Percentile.h:70-100`）。
+**②③④ 入池**：通过两道闸门后，把原始值 `push_back` 进 `data_`，并 `sum += value`；
+同时把 `isSorted_` 置 `false`（惰性排序，见 0.2.5）。
 
-读出接口 `nth()`/`avg()`/`save_cdf()` 仅在**线程退出时**（`onExit` / `print_*_stats`）调用并打印。
+> 还有一个重载 `add(const std::vector<T> &v)`（`Percentile.h:35-39`）：它**绕过两道闸门**，
+> 直接整段 `std::copy` 合并，用于把别处已采好的样本批量并入。
+
+#### 0.2.3 `nth(n)`：百分位查询与 nearest-rank 算法
+
+```cpp
+// common/Percentile.h:57-68
+element_type nth(double n) {
+    if (data_.size() == 0) return 0;          // 无样本 ⇒ 返回 0
+    checkSort();                              // 惰性排序: 仅在此刻确保 data_ 有序
+    DCHECK(n > 0 && n <= 100);
+    auto sz = size();
+    auto i = static_cast<decltype(sz)>(ceil(n / 100 * sz)) - 1;  // ★ nearest-rank
+    DCHECK(i >= 0 && i < size());
+    return data_[i];
+}
+```
+
+算法是 [nearest-rank 法](https://en.wikipedia.org/wiki/Percentile)：对**升序**样本，第 `n` 百分位
+取**第 `ceil(n/100 × N)` 个**样本（1 基序号），代码用 `-1` 转成 0 基下标。
+**它返回的是真实存在的某个样本值**（不做插值）。
+
+#### 0.2.4 `nth(50)` / `nth(90)` / `nth(99)` 到底表示什么
+
+| 调用 | 名称 | 含义（对升序样本而言） | 解读 |
+|---|---|---|---|
+| `nth(50)` | **中位数 / p50** | 50% 的样本 **≤** 该值 | "一半请求"的典型延迟，受离群值影响小 |
+| `nth(90)` | **p90** | 90% 的样本 ≤ 该值，仅 10% 更慢 | 较慢的一档，开始反映抖动 |
+| `nth(99)` | **p99（尾延迟）** | 99% 的样本 ≤ 该值，仅 1% 更慢 | **尾延迟 / tail latency**，衡量最坏体验、SLA 的关键指标 |
+| `nth(100)` | **最大值** | 全部样本 ≤ 该值 | 观测到的最差单次 |
+
+**注意**：百分位是在**被采样保留的 ~10.9% 样本**上计算的，是对真实分布的**估计**；p99 这类尾部
+分位对采样更敏感（尾部样本本就稀少）。这是"低开销"与"尾部精度"之间的工程折中。
+
+**一个具体的统计演算**——设某实例 `add()` 后保留下的样本（已排序）为
+`[10, 20, 30, 40, 50, 60, 70, 80, 90, 100]`（`N = 10`，单位 μs）：
+
+| 查询 | 下标计算 `ceil(n/100×10)-1` | 命中 | 结果 |
+|---|---|---|---|
+| `nth(50)` | `ceil(5.0)-1 = 4` | `data_[4]` | **50 μs** |
+| `nth(90)` | `ceil(9.0)-1 = 8` | `data_[8]` | **90 μs** |
+| `nth(99)` | `ceil(9.9)-1 = 9` | `data_[9]` | **100 μs** |
+| `nth(100)`| `ceil(10.0)-1 = 9`| `data_[9]` | **100 μs** |
+
+可见 p99 与 max 在小样本下可能落到同一个样本上——样本越多，分位才越细分。
+
+#### 0.2.5 `avg()` 与惰性排序 `checkSort()`
+
+```cpp
+// common/Percentile.h:52-55
+element_type avg() { return sum / (size() + 0.1); }   // +0.1 防 0 样本时除零
+```
+`avg()` 用 `add()` 时维护的 `sum` 与样本数算**算术平均**，**无需排序**；`+0.1` 是防止
+样本数为 0 时整型除零的小技巧（0 样本时返回 ~0）。
+
+```cpp
+// common/Percentile.h:103-109
+void checkSort() { if (!isSorted_) { std::sort(data_.begin(), data_.end()); isSorted_ = true; } }
+```
+**惰性排序**：`add()` 只把 `isSorted_` 置假，并不立即排序；只有 `nth()` / `save_cdf()` 真正需要
+有序时才 `std::sort` 一次，之后 `isSorted_=true` 复用结果。由于统计**只在线程退出时读一次**，
+全程通常只排序一次，把排序成本从"每次插入"摊薄为"一次"。
+
+#### 0.2.6 `save_cdf(path)`：导出累积分布曲线
+
+```cpp
+// common/Percentile.h:70-100  (节选)
+auto step_size = std::max(1, int(data_.size() * 0.99 / 1000));   // 抽 ~1000 个点
+for (auto i = 0u; i < 0.99 * data_.size(); i += step_size) cdf_result.push_back(data_[i]);
+// 每行: 样本值 \t 累积占比(i+1)/cdf_result.size()
+```
+对有序样本**等步长抽 ~1000 个点**（丢掉最后 1% 极端尾巴），输出 `value<TAB>cdf` 两列文本，
+即 CDF 曲线数据。仅 `id == 0` 的 worker 调用（`Executor.h:264`），路径来自 `context.cdf_path`。
+
+#### 0.2.7 "实例怎么统计"——生命周期全貌
+
+每个 `Percentile` 实例是某个**线程私有对象的成员**（如 `Executor::commit_latency`、
+`Executor::percentile`、`IncomingDispatcher::socket_message_recv_latency`、
+`PashaGroupCommitLogger::txn_latency`），因此：
+
+- **无锁**：单线程读写自己的 `Percentile`，`data_`/`sum` 都不需要原子或互斥。
+- **不跨线程聚合**：与 §0.1 的原子计数器不同，`Percentile` 的结果**各线程各自打印**
+  （`onExit` 里每个 worker 打一行"Worker N latency …"），并不汇总成全局分位。
+- **读一次即终**：`nth()` 在线程退出时被调用，把分布定格为 50/75/95/99 几个数打到日志。
+
+```mermaid
+flowchart TB
+    subgraph RUN["稳态运行期 (每事务/每消息)"]
+        A["代码路径产生一个延迟值 value"]
+        B{"warmed_up?<br/>且 uniform(0,100) ≤ 10 ?"}
+        A --> B
+        B -->|"否 (约 89.1%)"| DROP["丢弃, 不计入"]
+        B -->|"是 (约 10.9%)"| KEEP["data_.push_back(value)<br/>sum += value<br/>isSorted_ = false"]
+    end
+    subgraph EXIT["线程退出 onExit / print_stats"]
+        S["checkSort(): std::sort 一次"]
+        N50["nth(50) = 升序第 ceil(0.5N) 个样本  中位数"]
+        N90["nth(90) = 升序第 ceil(0.9N) 个样本  p90"]
+        N99["nth(99) = 升序第 ceil(0.99N) 个样本  p99 尾延迟"]
+        AV["avg() = sum / (N+0.1)"]
+        S --> N50 --> N90 --> N99
+    end
+    KEEP --> S
+    KEEP -.->|"sum 累加, 无需排序"| AV
+```
+
+> **小结**：`Percentile` = "稳态门控 + ~10.9% 伯努利采样 + 全量留存 + 惰性排序 + nearest-rank 取分位"。
+> `nth(50/90/99)` 分别是中位数 / p90 / p99（尾延迟），数值越靠后越能暴露系统在压力下的最差表现。
+
+读出接口 `nth()` / `avg()` / `save_cdf()` 仅在**线程退出时**（`onExit` / `print_*_stats`）调用并打印。
 
 ---
 
