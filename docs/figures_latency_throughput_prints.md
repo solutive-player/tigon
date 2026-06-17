@@ -263,6 +263,83 @@ element_type avg() { return sum / (size() + 0.1); }   // 仅对抽样值求均�
 | 单位 | txns/sec | µs（`/1000` 从 ns 转） |
 | 统计性质 | 精确总量平均 | 抽样经验分位 |
 
+---
+
+## 6. 多节点数据汇总与各节点统计范围
+
+实验是 `coordinator_num` 个 host（进程）并行跑。本节讲清：**每个 host 在本地统计的数据范围是什么、最终如何汇总成图表里的一个数**。核心结论先行——
+
+> 吞吐和 CXL 用量是**加性指标**，由 `STATISTICS` 消息汇总到 host0 **求和**；时延**不进汇总消息**，各 host 各自打印、图表只取 **host0 那一份**。
+
+### 6.1 三类指标的统计范围与汇总方式
+
+| 指标 | 每个 host 的统计范围 | 跨 host 汇总 | 最终落到哪条打印 |
+|---|---|---|---|
+| 吞吐 `commit` | 本 host 所有 worker 提交的事务数（= 本 host **发起/拥有**的事务，`n_commit` 之和 / count） | `STATISTICS` 消息 → host0 **相加** | host0 的 `Global Stats`（Coordinator.h:610） |
+| CXL 6 类用量 | 本 host 进程向 CXL 共享区的分配量（index/metadata/data/transport/misc/hw_cc） | 同上 **相加** | host0 的 `Global Stats` |
+| 时延 `txn_latency` | 本 host 自己的 logger 测的、流经**本 host** 的事务（抽样分位） | **不汇总**，各 host 各打各的 | 各 host 的 `Group Commit Stats`；图表取 host0 那份 |
+
+### 6.2 `STATISTICS` 消息：只携带吞吐 + CXL 用量，没有时延
+
+汇总用的控制消息字段固定（`core/ControlMessage.h:18-37` `new_statistics_message`）：
+```cpp
+encoder << coordinator_id << commit                       // int + double
+        << size_index_usage << size_metadata_usage << size_data_usgae
+        << size_transport_usage << size_misc_usage << size_hwcc_usage;   // 6 × uint64
+```
+即 `coordinator_id(int) + commit(double) + 6×uint64 CXL 用量`。host0 解码时还会 `CHECK` 长度正好是这些字段之和（`Coordinator.h:568`）。**没有任何 latency 字段** → 时延天然无法跨节点聚合。
+
+### 6.3 汇总流程：`gather_and_print`（所有 host 都调用）
+
+测量结束、所有 worker 停止并 join 后（`Coordinator.h:359-364`），**每个 host** 都调用 `gather_and_print`（`:374`），传入自己的 `1.0*total_commit/count` 与 6 类 CXL 用量：
+
+- **非 host0**（`else` 分支，`Coordinator.h:591-603`）：用自己的 commit + 用量构造 `STATISTICS` 消息，`out_queue.push` 或 `cxl_transport->send` 发给 host0。
+- **host0**（`id==0` 分支，`:556-589`）：循环 `coordinator_num - 1` 次，`in_queue.wait_till_non_empty` 收消息、解码，逐项累加：
+  ```cpp
+  commit += r_commit;              // :581（hash 分区下所有 host 都加）
+  size_index_usage += r_size_index_usage;  // :583 等 6 行
+  ```
+  host0 传入的初值是**它自己**的 `total_commit/count`（`:374`），所以最终 `Global Stats` = **host0 自己 + Σ 其余 host**，再于 `:610` 打印。
+
+### 6.4 为什么吞吐「相加」、时延「不汇总」
+
+- **吞吐 / CXL 用量是加性的**：每个 host 提交的是**不同的**事务（事务按发起 host 划分，无重复计数）；CXL 各 host 分配的是共享区里**各自的**字节。相加即得全 pod 总量，语义正确。
+- **时延是分布、不可简单相加**：要得到全 pod 的 P50/P99，必须把各 host 的**样本集合并**后重新排序取分位，代价大且消息要带样本。代码选择最省事的做法——**只让各 host 打印自己本地的分位**，图表取 host0 的 `Group Commit Stats`。因此严格说，图里的时延是 **host0 视角的代表值**，不是全 pod 聚合分位（各 host 负载对称时近似可代表全局）。
+
+### 6.5 「事务范围」细节：为什么相加不重不漏
+
+- 每个 host 的 worker 只驱动**它自己生成**的事务（`workload.next_transaction` 按本 host 的 partition 生成）。远程访问通过 Pasha 迁移读到远端数据，但**事务由发起 host 提交**，`n_commit` 计在发起 host 上。
+- 因此 hash 分区下 `Σ_host total_commit` 对全 pod 事务**无重复、无遗漏**。
+- **`hpb` 副本分区特例**（`Coordinator.h:574-579`）：副本 coordinator 的 commit 被单独计入 `replica_sum`（`:578`、`:605` 另行打印），**不计入吞吐**，避免主/副本重复计数。默认 `hash` 分区无此问题，全部相加。
+
+### 6.6 时序：先出全局吞吐，再出各 host 时延
+
+```
+跑完(:341) → 算 total_commit/count → 停 worker 并 join(:359-364)
+   → 各 host 打印自己的 CXL/SCC stats(:367/:370)
+   → gather_and_print(:374)：host0 收齐并打印  ★Global Stats（吞吐+CXL，全局汇总）
+   → (停 IO 线程后) 各 host master_logger->print_sync_stats(:400-401)：★Group Commit Stats（时延，各自本地）
+```
+所以 output.txt 里 **`Global Stats`（吞吐）在前、`Group Commit Stats`（时延）在后**（对应 README:92 然后 :94）。host0 的 output.txt 同时含两者；其余 host 的 output.txt 只有自己的本地 `Group Commit Stats`（除非 `GATHER_OUTPUTS=1` 才被收集，但图表不用）。
+
+### 6.7 一图看懂多节点汇总
+
+```
+ host1 ┐ (commit_1 + CXL用量_1)  ─STATISTICS消息→┐
+ host2 ┤ (commit_2 + CXL用量_2)  ─STATISTICS消息→┤
+  ...  ┤                                          ├─► host0 求和
+ hostN ┘ (commit_N + CXL用量_N)  ─STATISTICS消息→┘     commit = Σ commit_i
+                                                       size_* = Σ size_*_i
+                                                       └─► Coordinator.h:610 打印 Global Stats（吞吐/CXL）
+
+ 各 host 独立：master_logger->print_sync_stats() → 各自的 Group Commit Stats（时延，本地抽样分位，不汇总）
+              图表只取 host0 这一份
+```
+
+---
+
+## 7. 坑点与注意事项
+
 
 
 1. **行号偏移（重要）**：`parse_all.py` 与 README 硬编码行标记 `WALLogger.h:539]`，但**当前源码 `PashaGroupCommitLogger::print_sync_stats` 的首条 LOG 已在 `WALLogger.h:549`**。glog 打印的是 `LOG()` 语句所在行号，代码上移/下移会改变它。若用当前源码构建却用旧 `parse_all.py` 解析，**时延列会全空**（匹配不到）。修法：跑前 `grep -n "Group Commit Stats" common/WALLogger.h` 确认实际行号，同步改 `parse_all.py:45/57` 的 `"WALLogger.h:XXX]"`。吞吐侧 `Coordinator.h:610` 同理需对齐。
@@ -274,10 +351,11 @@ element_type avg() { return sum / (size() + 0.1); }   // 仅对抽样值求均�
 7. **ns/µs 单位不一致（影响时延语义）**：`WALLogger.h:412-413` 存入 `txn_start_times` 时用 `Time::now()`（**ns**）减 `latency`（**µs**），而 `:520-523` 又用 `Time::now()`（ns）算差并 `/1000`。净效果是事务执行段时延被多除 1000×而几近消失，**实际 `txn_latency` 由 commit-record 落盘延迟主导**（见 §2.2/§5.2）。即「端到端」是设计意图，落到数字上更接近「记录→durable」。
 8. **Percentile 抽样率注释与实现不符**：`Percentile.h:28` 注释写 "record 2% of the data"，但实现 `uniform_dist(0,100) > 10 → return` 实际记录约 `11/101 ≈ 10.9%`。分析时延样本量时以实现为准。
 9. **时延是抽样、吞吐是全量**：`txn_latency`/`commit_latency` 等都经 `Percentile` 约 11% 抽样且仅预热后记录；`n_commit` 是全量精确计数。比较「样本数」时别把两者当同口径。
+10. **时延是 host0 视角、吞吐是全 pod 求和**：`STATISTICS` 消息只汇总吞吐+CXL 用量（host0 求和，§6.3），时延不进汇总——图表里的时延只反映 host0 本地的 `Group Commit Stats`（§6.4）。负载非对称时，它不代表全 pod 分位。
 
 ---
 
-## 7. 数据流总图
+## 8. 数据流总图
 
 ```
                        bench_* 进程（host0 前台）
