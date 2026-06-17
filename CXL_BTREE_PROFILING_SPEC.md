@@ -1,11 +1,10 @@
 # CXL B+ 树增删改查细粒度时延打点 — 源码修改方案 SPEC
 
-> 版本：v3.0　|　日期：2026-06-10　|　对象：`core/CXLTable.h` + `core/Table.cpp` + `core/Coordinator.h`
+> 版本：v4.0　|　日期：2026-06-10　|　对象：`core/CXLTable.h` + `core/Table.cpp` + `core/Coordinator.h`
 >
 > 本文是 [`PERF_MONITORING_SPEC.md`](./PERF_MONITORING_SPEC.md) §5.7 的落地实现。
-> **约束**：**不新增任何文件、不新增任何类/结构体/枚举**；计时统一用现有的 **`star::Time`**；
-> **不使用编译开关宏**——打点始终生效。只复用现有设施（`extern std::atomic` 全局计数 + `LOG`），
-> 与 `MigrationManager` 的 `num_data_move_in/out`（`protocol/Pasha/MigrationManager.cpp`）同风格。
+> **约束**：**不新增文件、不新增类/结构体/枚举**；计时用现有 **`star::Time`**；**不使用编译开关宏**；
+> **所有时延变量统一用现有的 `star::Percentile` 收集**（`common/Percentile.h`）。
 
 ---
 
@@ -13,30 +12,9 @@
 
 | 检查项 | 源码 | 结论 |
 |---|---|---|
-| 精度 | `common/Time.h:13-18`：`Time::now()` 用 `duration_cast<std::chrono::nanoseconds>` 返回 **纳秒** | B+ 树单次操作常 < 1µs，**纳秒精度足够**，不会像 `ScopedTimer`（回调单位为微秒，`Time.h:39`）那样被截断为 0 |
-| 起点初始化 | `common/Time.cpp:9`：`Time::startTime = steady_clock::now()`（静态初始化） | 程序加载即有效，打点处直接 `Time::now()` 取差值即可 |
-| 时钟单调性 | `steady_clock` | 单调，适合测时延 |
-| 可用性 | 已被 `Dispatcher.h`/`ControlMessage.h`/`TwoPLPashaMessage.h` 等广泛使用 | 仅需在 `core/CXLTable.h` 顶部 `#include "common/Time.h"` |
-
-**用法**：
-```cpp
-uint64_t t0 = star::Time::now();   // ns
-/* ... 被测操作 ... */
-uint64_t ns = star::Time::now() - t0;
-```
-
----
-
-## 目录
-1. [设计决策](#1-设计决策)
-2. [增删改查 → 代码入口映射](#2-增删改查--代码入口映射)
-3. [修改①：全局计数器（`core/CXLTable.h` 声明 + `core/Table.cpp` 定义）](#3-修改全局计数器声明--定义)
-4. [修改②：在 `core/CXLTable.h` wrapper 打点（用 `star::Time`）](#4-修改在-corecxltableh-wrapper-打点用-startime)
-5. [修改③：程序结束时的数据收集（`core/Coordinator.h`）](#5-修改程序结束时的数据收集corecoordinatorh)
-6. [可选增强：要分位数时复用现有 `Executor`+`Percentile`](#6-可选增强要分位数时复用现有-executorpercentile)
-7. [线程安全与开销](#7-线程安全与开销)
-8. [示例输出与验证](#8-示例输出与验证)
-9. [改动清单速查](#9-改动清单速查)
+| 精度 | `common/Time.h:13-18`：`Time::now()` 返回 **纳秒** | <1µs 的 B+ 树操作不会被截断（区别于 `ScopedTimer` 微秒回调 `Time.h:39`） |
+| 起点 | `common/Time.cpp:9`：`startTime` 静态初始化 | 程序加载即有效 |
+| 用法 | `uint64_t t0=Time::now(); ...; uint64_t ns=Time::now()-t0;` | 仅需 `#include "common/Time.h"` |
 
 ---
 
@@ -44,78 +22,69 @@ uint64_t ns = star::Time::now() - t0;
 
 | 决策 | 选择 | 理由 |
 |---|---|---|
-| **不新增文件/类** | 复用 `extern std::atomic<uint64_t>` 全局变量（**自由变量，非类**）+ 自由 `inline` 函数 + `LOG` | 满足约束；与 `MigrationManager.cpp` 的 `num_data_move_in/out` 完全同构 |
-| **不用编译开关宏** | 打点代码**始终编译、始终生效**（无 `#ifdef`） | 按要求移除 `TIGON_BTREE_PROFILING`；开销极小（见 §7），可常驻 |
-| **计时** | `star::Time::now()`（纳秒） | 见 §0，可行且精度足够 |
-| **打点层次** | wrapper 层 `CXLTableBTreeOLC`（`core/CXLTable.h:83-203`） | 增删改查天然边界（`search/scan/insert/remove` `:132/147/164/179`）；**驻 DRAM、每 host 一份**；底层 `btreeolc_cxl::BPlusTree` 在 **CXL 共享内存跨进程共享**（`:200`），**绝不能加字段** |
-| **聚合粒度** | 每 host 进程一组全局原子计数（被该 host 所有 worker 线程共享累加） | 与 `scc_manager`/`migration_manager` 的 per-host 统计一致 |
-| **指标** | 每操作：`cnt` / `sum_ns`(→avg) / `max_ns` | 原子、无锁；分位数见 §6 可选方案 |
-| **收集时机** | `Coordinator` 退出、worker join 后，紧挨 `scc_manager->print_stats()`（`Coordinator.h:371`） | 数据已稳定 |
-
-> **约束解读**：不新增 `.h/.cpp` 文件、不新增 `class/struct/enum`、不引入编译宏。允许：在**既有文件**中
-> 新增 `extern` 全局变量、`inline` 自由函数、`LOG` 语句，以及给**既有类**加成员（§6 用到）。
+| **统一用 `Percentile` 收集** | 每种操作一个全局 `star::Percentile<uint64_t>`（既有类，`common/Percentile.h`），存纳秒时延 | 满足"所有相关变量用 Percentile"；可直接出 `avg()/nth(50/75/95/99)` 与 CDF（`save_cdf`） |
+| **线程安全** | 全局 `std::mutex` 短临界区保护 `Percentile::add` | `Percentile` 非线程安全（`add` 内 `data_.push_back` `Percentile.h:31`）；wrapper 被一个 host 的多 worker 共享 |
+| **可接受锁开销** | CXL B+ 树只服务**迁移/远端**数据（非本地 DRAM 热路径），且 `Percentile::add` 仅在 `warmed_up` 时按 ~10% 采样（`Percentile.h:28`） | 实际进入临界区的频率很低，锁竞争可忽略；如仍敏感见 §6 无锁变体 |
+| **不新增文件/类/宏** | 复用 `extern Percentile` 全局变量 + `extern std::mutex` + `LOG` | 与 `MigrationManager.cpp` 全局变量风格一致 |
+| **计时** | `star::Time::now()`（纳秒） | 见 §0 |
+| **打点层次** | wrapper 层 `CXLTableBTreeOLC`（`core/CXLTable.h:83-203`） | 增删改查天然边界（`:132/147/164/179`）；驻 DRAM、每 host 一份；底层 `BPlusTree` 在 CXL 共享内存跨进程共享（`:200`），**绝不能加字段** |
+| **收集时机** | `Coordinator` 退出、worker join 后，紧挨 `scc_manager->print_stats()`（`Coordinator.h:371`） | 数据稳定，`nth()` 排序安全 |
 
 ---
 
 ## 2. 增删改查 → 代码入口映射
 
-| 语义 | wrapper 方法（`core/CXLTable.h`） | 底层 CXL B+ 树（`BTreeOLC_CXL.h`） |
-|---|---|---|
-| **查 (point)** | `search()` `:132` | `lookup(k,value)` `:2648` |
-| **查 (range)/扫** | `scan()` `:147` | `scanForUpdate(min_k,proc)` `:2292` |
-| **增** | `insert()` `:164` | `insert(k,value)` `:1668` |
-| **删** | `remove()` `:179` | `remove(k)` `:2180` |
-| **改** | *(wrapper 未暴露)* | `lookupForUpdate(k,proc)` `:2657`；当前点更新走 `search()`+SCC `do_write`（PERF_SPEC §5.6） |
+| 语义 | wrapper 方法（`core/CXLTable.h`） | 底层 CXL B+ 树（`BTreeOLC_CXL.h`） | 对应 Percentile |
+|---|---|---|---|
+| **查 (point)** | `search()` `:132` | `lookup` `:2648` | `cxl_btree_search_pct` |
+| **查 (range)/扫** | `scan()` `:147` | `scanForUpdate` `:2292` | `cxl_btree_scan_pct` |
+| **增** | `insert()` `:164` | `insert` `:1668` | `cxl_btree_insert_pct` |
+| **删** | `remove()` `:179` | `remove` `:2180` | `cxl_btree_remove_pct` |
+| **改** | *(未暴露)* | `lookupForUpdate` `:2657` | （需要时加 `cxl_btree_update_pct`） |
 
 ---
 
-## 3. 修改①：全局计数器（声明 + 定义）
+## 3. 修改①：全局 `Percentile` 变量（声明 + 定义）
 
-**声明** —— 在 `core/CXLTable.h` 的 `namespace star {` 内（例如紧跟 `:13` 之后）追加；同时在文件顶部
-`#include "common/Time.h"` 与 `#include <atomic>`：
+**声明** —— `core/CXLTable.h` 顶部追加 include；`namespace star {` 内（`:13` 后）追加全局变量：
 
 ```cpp
 // core/CXLTable.h —— 顶部 include 区
 #include "common/Time.h"
-#include <atomic>
+#include "common/Percentile.h"
+#include <mutex>
 
-// core/CXLTable.h —— namespace star 内，全局计数器（增删改查 + 扫）
-// 命名沿用 MigrationManager.cpp 中 num_data_move_in/out 的全局原子风格
-extern std::atomic<uint64_t> cxl_btree_search_cnt, cxl_btree_search_ns, cxl_btree_search_max_ns;
-extern std::atomic<uint64_t> cxl_btree_scan_cnt,   cxl_btree_scan_ns,   cxl_btree_scan_max_ns;
-extern std::atomic<uint64_t> cxl_btree_insert_cnt, cxl_btree_insert_ns, cxl_btree_insert_max_ns;
-extern std::atomic<uint64_t> cxl_btree_remove_cnt, cxl_btree_remove_ns, cxl_btree_remove_max_ns;
-
-// 无锁 max 更新（自由 inline 函数，非类）；C++17 无 atomic::fetch_max，用 CAS 循环
-static inline void cxl_btree_atomic_max(std::atomic<uint64_t> &m, uint64_t v)
-{
-        uint64_t cur = m.load(std::memory_order_relaxed);
-        while (v > cur && !m.compare_exchange_weak(cur, v, std::memory_order_relaxed)) { }
-}
+// core/CXLTable.h —— namespace star 内
+// 所有时延统一用 Percentile 收集（纳秒）；一个全局 mutex 保护并发 add
+extern std::mutex                cxl_btree_pct_mutex;
+extern star::Percentile<uint64_t> cxl_btree_search_pct;
+extern star::Percentile<uint64_t> cxl_btree_scan_pct;
+extern star::Percentile<uint64_t> cxl_btree_insert_pct;
+extern star::Percentile<uint64_t> cxl_btree_remove_pct;
 ```
 
-**定义** —— 在**既有文件** `core/Table.cpp`（属于 `CMakeLists.txt:27` 的 `core/*.cpp` GLOB，自动编译）中追加：
+**定义** —— 既有文件 `core/Table.cpp`（已被 `CMakeLists.txt:27` 的 `core/*.cpp` GLOB 自动编译）追加：
 
 ```cpp
-// core/Table.cpp 末尾，namespace star 内
+// core/Table.cpp，namespace star 内
 #include "core/CXLTable.h"   // 若尚未包含
 
 namespace star {
-std::atomic<uint64_t> cxl_btree_search_cnt{0}, cxl_btree_search_ns{0}, cxl_btree_search_max_ns{0};
-std::atomic<uint64_t> cxl_btree_scan_cnt{0},   cxl_btree_scan_ns{0},   cxl_btree_scan_max_ns{0};
-std::atomic<uint64_t> cxl_btree_insert_cnt{0}, cxl_btree_insert_ns{0}, cxl_btree_insert_max_ns{0};
-std::atomic<uint64_t> cxl_btree_remove_cnt{0}, cxl_btree_remove_ns{0}, cxl_btree_remove_max_ns{0};
+std::mutex                cxl_btree_pct_mutex;
+star::Percentile<uint64_t> cxl_btree_search_pct;
+star::Percentile<uint64_t> cxl_btree_scan_pct;
+star::Percentile<uint64_t> cxl_btree_insert_pct;
+star::Percentile<uint64_t> cxl_btree_remove_pct;
 }
 ```
 
 ---
 
-## 4. 修改②：在 `core/CXLTable.h` wrapper 打点（用 `star::Time`）
+## 4. 修改②：在 `core/CXLTable.h` wrapper 打点（`star::Time` 计时 + `Percentile` 收集）
 
-只在每个方法首尾加计时与原子累加（**始终生效，无宏开关**）。为避免多处 `return` 漏记，
-对有提前返回的方法把返回值收敛到一个局部变量后统一记录。
+每个方法首尾用 `star::Time::now()` 计时，临界区内 `Percentile::add(ns)`。有提前返回的方法收敛到单出口。
 
-**查 — `search()`（`CXLTable.h:132-145`）改为单出口：**
+**查 — `search()`（`CXLTable.h:132-145`）：**
 ```cpp
 virtual void *search(const void *key) override
 {
@@ -129,14 +98,12 @@ virtual void *search(const void *key) override
                 ret = value.row.get();
         }
         uint64_t _ns = star::Time::now() - _t0;
-        cxl_btree_search_cnt.fetch_add(1, std::memory_order_relaxed);
-        cxl_btree_search_ns.fetch_add(_ns, std::memory_order_relaxed);
-        cxl_btree_atomic_max(cxl_btree_search_max_ns, _ns);
+        { std::lock_guard<std::mutex> _g(cxl_btree_pct_mutex); cxl_btree_search_pct.add(_ns); }
         return ret;
 }
 ```
 
-**扫 — `scan()`（`CXLTable.h:147-162`，单出口，最简单）：**
+**扫 — `scan()`（`CXLTable.h:147-162`）：**
 ```cpp
 virtual void scan(const void *min_key, std::function<bool(const void *, void *, bool)> scan_processor) override
 {
@@ -147,14 +114,12 @@ virtual void scan(const void *min_key, std::function<bool(const void *, void *, 
         };
         cxl_btree_->scanForUpdate(min_k, processor);
         uint64_t _ns = star::Time::now() - _t0;
-        cxl_btree_scan_cnt.fetch_add(1, std::memory_order_relaxed);
-        cxl_btree_scan_ns.fetch_add(_ns, std::memory_order_relaxed);
-        cxl_btree_atomic_max(cxl_btree_scan_max_ns, _ns);
+        { std::lock_guard<std::mutex> _g(cxl_btree_pct_mutex); cxl_btree_scan_pct.add(_ns); }
 }
 ```
-> 注：scan 计的是"含用户回调"的整段扫描时延（回调在事务侧做下一键加锁等逻辑）。若要剔除回调、只测纯遍历，需深入 `scanForUpdate` 内部打点——那在共享内存代码里，权衡后本方案测整段，语义更贴近"事务看到的扫描时延"。
+> scan 计的是"含事务侧回调"的整段扫描时延（回调做下一键加锁等）。
 
-**增 — `insert()`（`CXLTable.h:164-177`，已有 `success`）：**
+**增 — `insert()`（`CXLTable.h:164-177`）：**
 ```cpp
 virtual bool insert(const void *key, void *row, bool is_placeholder = false) override
 {
@@ -165,9 +130,7 @@ virtual bool insert(const void *key, void *row, bool is_placeholder = false) ove
         value.is_valid.store(is_placeholder == true ? false : true);
         bool success = cxl_btree_->insert(k, value);
         uint64_t _ns = star::Time::now() - _t0;
-        cxl_btree_insert_cnt.fetch_add(1, std::memory_order_relaxed);
-        cxl_btree_insert_ns.fetch_add(_ns, std::memory_order_relaxed);
-        cxl_btree_atomic_max(cxl_btree_insert_max_ns, _ns);
+        { std::lock_guard<std::mutex> _g(cxl_btree_pct_mutex); cxl_btree_insert_pct.add(_ns); }
         return success;
 }
 ```
@@ -181,96 +144,92 @@ virtual bool remove(const void *key, void *row) override
         bool success = cxl_btree_->remove(k);
         CHECK(success == true);
         uint64_t _ns = star::Time::now() - _t0;
-        cxl_btree_remove_cnt.fetch_add(1, std::memory_order_relaxed);
-        cxl_btree_remove_ns.fetch_add(_ns, std::memory_order_relaxed);
-        cxl_btree_atomic_max(cxl_btree_remove_max_ns, _ns);
+        { std::lock_guard<std::mutex> _g(cxl_btree_pct_mutex); cxl_btree_remove_pct.add(_ns); }
         return success;
 }
 ```
 
-> **改（改值）**：当前 wrapper 不暴露 update（点更新走 `search()`+SCC 写，已被 `search` 计时覆盖一半）。若日后需要 B+ 树级原子改值，可仿照上面包装 `cxl_btree_->lookupForUpdate`（`BTreeOLC_CXL.h:2657`）并复用同样的打点四件套——**仍无需新类/新文件/新宏**。
+> **改**：点更新当前走 `search()`+SCC 写（已被 `search_pct` 覆盖前半段）。若要 B+ 树级原子改值，仿照上面包装 `lookupForUpdate`（`BTreeOLC_CXL.h:2657`）并新增 `cxl_btree_update_pct`——仍无需新类/文件/宏。
 
 ---
 
 ## 5. 修改③：程序结束时的数据收集（`core/Coordinator.h`）
 
-在 `scc_manager->print_stats()` 之后（`core/Coordinator.h:371`）追加几行 `LOG`（用一个**局部 lambda**算 avg，非类）：
+在 `scc_manager->print_stats()` 之后（`core/Coordinator.h:371`）追加，从各 `Percentile` 取分位数与均值：
 
 ```cpp
-                // print software cache-coherence stats
                 if (scc_manager != nullptr)
                         scc_manager->print_stats();
 
-                // ===== CXL B+tree 增删改查时延收集（每 host 一份） =====
-                auto _avg = [](std::atomic<uint64_t> &sum, std::atomic<uint64_t> &cnt) -> uint64_t {
-                        uint64_t c = cnt.load();
-                        return c ? sum.load() / c : 0;
-                };
-                LOG(INFO) << "[CXL-BTree CRUD] host " << id
-                          << " | SEARCH cnt=" << cxl_btree_search_cnt.load()
-                          << " avg_ns=" << _avg(cxl_btree_search_ns, cxl_btree_search_cnt)
-                          << " max_ns=" << cxl_btree_search_max_ns.load()
-                          << " | SCAN cnt=" << cxl_btree_scan_cnt.load()
-                          << " avg_ns=" << _avg(cxl_btree_scan_ns, cxl_btree_scan_cnt)
-                          << " max_ns=" << cxl_btree_scan_max_ns.load()
-                          << " | INSERT cnt=" << cxl_btree_insert_cnt.load()
-                          << " avg_ns=" << _avg(cxl_btree_insert_ns, cxl_btree_insert_cnt)
-                          << " max_ns=" << cxl_btree_insert_max_ns.load()
-                          << " | REMOVE cnt=" << cxl_btree_remove_cnt.load()
-                          << " avg_ns=" << _avg(cxl_btree_remove_ns, cxl_btree_remove_cnt)
-                          << " max_ns=" << cxl_btree_remove_max_ns.load();
+                // ===== CXL B+tree 增删改查时延收集（每 host 一份，统一用 Percentile） =====
+                {
+                        std::lock_guard<std::mutex> _g(cxl_btree_pct_mutex);
+                        auto _dump = [&](const char *name, star::Percentile<uint64_t> &p) {
+                                LOG(INFO) << "[CXL-BTree CRUD] host " << id << " " << name
+                                          << " samples=" << p.size()        // 采样计数(~10%)
+                                          << " avg_ns=" << p.avg()
+                                          << " p50=" << p.nth(50) << " p75=" << p.nth(75)
+                                          << " p95=" << p.nth(95) << " p99=" << p.nth(99);
+                        };
+                        _dump("SEARCH(查)", cxl_btree_search_pct);
+                        _dump("SCAN(扫)",   cxl_btree_scan_pct);
+                        _dump("INSERT(增)", cxl_btree_insert_pct);
+                        _dump("REMOVE(删)", cxl_btree_remove_pct);
+                }
 ```
-> `core/Coordinator.h` 已 include 多个 common 头；`core/CXLTable.h` 中声明的 extern 通过现有
-> include 链可见（Coordinator → Executor → ... → Table/CXLTable）。如不可见，在 `Coordinator.h`
-> 顶部补 `#include "core/CXLTable.h"` 即可。该处 worker 已全部 join，原子计数已稳定。
+> - `Coordinator.h` 通过现有 include 链可见这些 extern；如不可见，顶部补 `#include "core/CXLTable.h"`。
+> - 此处 worker 已全部 join，`Percentile::nth()` 内部排序（`Percentile.h:103`）安全。
+> - 如需 CDF，可对每个 `Percentile` 调 `save_cdf(path)`（`Percentile.h:70`），路径由 `context.cdf_path` 派生。
 
-> `core/Table.cpp` 已被 `CMakeLists.txt:27` 的 `file(GLOB_RECURSE ... core/*.cpp)` 收集，**无需改 CMake、无需新增源文件**。
+> **采样说明**：`Percentile::add` 仅在 `warmed_up==true` 时按 ~10% 采样（`Percentile.h:28`），故 `size()`
+> 是采样计数；分位数与均值是该 ~10% 样本的统计，与现有 `commit_latency` 等指标口径一致。
 
 ---
 
-## 6. 可选增强：要分位数时复用现有 `Executor`+`Percentile`
+## 6. 可选：无锁变体（要消除全局锁时）
 
-§3-§5 的全局原子方案给出 `cnt/avg/max`。若还要 **p50/p95/p99 分位数**，**仍不新增类/文件/宏**——
-给**既有类** `Executor`（`core/Executor.h`）加 `Percentile<uint64_t>` 成员（`Percentile` 是既有类），
-在既有 `onExit()` 里打印（与现有 `commit_latency` 等一致）：
-
-- 加成员（`Executor.h:389` 附近）：
+若担心全局 `mutex` 在高频场景的竞争，可改为**每 worker 线程各一份 `Percentile`**（仍是既有类，无新类/文件）：
+- 给既有类 `Executor`（`core/Executor.h:389` 附近）加成员：
   ```cpp
   Percentile<uint64_t> cxl_btree_search_pct, cxl_btree_scan_pct, cxl_btree_insert_pct, cxl_btree_remove_pct;
   ```
-- 打点改为记录到"当前 worker 线程的 Executor"。由于 wrapper 被多线程共享、`Percentile` 非线程安全，
-  必须记录到**每线程**对象。在 worker 线程可见 `this`（Executor）的 **CXL B+ 树调用点** 处用
-  `Time::now()` 计时并 `this->cxl_btree_*_pct.add(ns)`：
-  - 查：`TwoPLPashaExecutor.h:136` 包住 `twopl_pasha_global_helper->get_migrated_row(...)`
-  - 扫：`TwoPLPashaExecutor.h:358` 包住 `target_cxl_table->scan(...)`
-  - 增/删：迁移路径在 worker 线程的 `process_request()`/`commit()` 内执行，于对应调用点记录。
-- 在既有 `onExit()`（`Executor.h:231`）的 LOG 末尾追加这几个 `nth(50/95/99)`。
-- `Percentile::add` 受 `warmed_up` 与 10% 采样约束（`Percentile.h:28`），开销可控。
+- 在 worker 线程可见 `this`（Executor）的 CXL B+ 树调用点用 `Time::now()` 计时并 `this->..._pct.add(ns)`：
+  查 `TwoPLPashaExecutor.h:136`（`get_migrated_row`）、扫 `:358`（`target_cxl_table->scan`）、
+  增/删在 `process_request()`/`commit()` 的迁移调用点。
+- 在既有 `onExit()`（`Executor.h:231`）按现有风格打印各 worker 的 `nth()`（每 worker 一行，天然无锁）。
+
+> 取舍：全局锁方案（§3-§5）**单点打点、覆盖所有调用方、输出一行聚合**，但有短临界区；
+> 无锁方案输出每 worker 一行、需在多个调用点插桩。鉴于 CXL B+ 树仅服务迁移/远端数据、且 10% 采样，
+> **默认推荐 §3-§5 全局锁方案**。
 
 ---
 
 ## 7. 线程安全与开销
 
-- **线程安全**：wrapper 实例被一个 host 的多 worker 线程共享 → 用 `std::atomic` 累加，**无数据竞争、无锁**。
-- **`max` 更新**：`cxl_btree_atomic_max` 用 `compare_exchange_weak` 自旋，仅在刷新最大值时偶发循环。
-- **计时开销（始终在线）**：每次操作 2 次 `star::Time::now()`（各 ≈ 一次 `steady_clock::now()`）+ 3 次 relaxed 原子加，合计约 ~40-60ns。查（search）最热（每次远端读都过）。由于已去掉编译开关，**开销常驻**——评估：相对单次 CXL 远端访问（数百 ns~µs 级）占比很小，可接受；若仍想进一步降噪，可在打点处加 `if (warmed_up)`（`Percentile.h:18` 的 extern，预热期不计），这是运行时判断、不引入编译宏。
-- **内存**：仅 12 个 `uint64_t` 原子，常数级。
+- **正确性**：全局 `Percentile` 的并发 `add` 由 `cxl_btree_pct_mutex` 保护，无数据竞争。
+- **计时**：每次操作 2 次 `star::Time::now()`（各 ≈ `steady_clock::now()`）。
+- **锁**：仅在 `warmed_up` 且命中 10% 采样时进入临界区，且 `add` 仅一次 `push_back`，临界区极短。
+- **内存**：每个 `Percentile` 仅存采样点（`std::vector`），随运行增长但受 10% 采样约束。
+- 始终生效（无编译宏）；预热期 `warmed_up==false` 时 `add` 直接返回（`Percentile.h:28`），开销近零。
 
 ---
 
 ## 8. 示例输出与验证
 
-退出日志（每 host 一行）：
+退出日志（每 host 4 行）：
 ```
-[CXL-BTree CRUD] host 0 | SEARCH cnt=128450 avg_ns=312 max_ns=8200 | SCAN cnt=3120 avg_ns=1850 max_ns=21000 | INSERT cnt=940 avg_ns=2100 max_ns=15300 | REMOVE cnt=512 avg_ns=2450 max_ns=17800
+[CXL-BTree CRUD] host 0 SEARCH(查) samples=12840 avg_ns=315 p50=270 p75=340 p95=560 p99=910
+[CXL-BTree CRUD] host 0 SCAN(扫)   samples=312   avg_ns=1850 p50=1600 p75=2100 p95=3900 p99=6100
+[CXL-BTree CRUD] host 0 INSERT(增) samples=94    avg_ns=2100 p50=1900 p75=2300 p95=4100 p99=15200
+[CXL-BTree CRUD] host 0 REMOVE(删) samples=51    avg_ns=2450 ...
 ```
 
 **验证：**
-1. `cmake .. && make` 通过（确认 extern 链接唯一、无重定义）。
+1. `cmake .. && make` 通过（extern 符号唯一、无重定义）。
 2. 跑 README hello-world（TPC-C / TwoPLPasha）：
    `./scripts/run.sh TPCC TwoPLPasha 8 3 mixed 10 15 1 0 1 Clock OnDemand 200000000 1 WriteThrough None 15 5 GROUP_WAL 20000 0 0`
-3. 退出日志出现 `[CXL-BTree CRUD]`；提高多分区比例时 SEARCH/SCAN 的 `cnt` 应明显上升。
-4. 对照 `PERF_MONITORING_SPEC.md` §5.7 预期；如需分布，按 §6 开启分位数变体。
+3. 退出日志出现 4 行 `[CXL-BTree CRUD]`；提高多分区比例时 SEARCH/SCAN 的 `samples` 明显上升。
+4. 对照 `PERF_MONITORING_SPEC.md` §5.7 预期；需要分布图时用 `save_cdf` + `scripts/plot`。
 
 ---
 
@@ -278,14 +237,14 @@ virtual bool remove(const void *key, void *row) override
 
 | 类型 | 文件（均为**既有**） | 位置 | 改动 |
 |---|---|---|---|
-| 改 | `core/CXLTable.h` | 顶部 | `#include "common/Time.h"`、`<atomic>` |
-| 改 | `core/CXLTable.h` | `namespace star` 内 | `extern` 12 个原子计数 + `inline cxl_btree_atomic_max` |
-| 改 | `core/CXLTable.h` | `:132/147/164/179` | 4 方法用 `star::Time::now()` 打点（search 改单出口） |
-| 改 | `core/Table.cpp` | 末尾 | 定义 12 个原子计数（含 include CXLTable.h） |
-| 改 | `core/Coordinator.h` | `:371` 后 | `LOG` 收集输出（局部 lambda 算 avg） |
-| 改（可选） | `core/Executor.h` + `protocol/TwoPLPasha/TwoPLPashaExecutor.h` | `:389` / `:136,358` | 加 `Percentile` 成员 + 调用点打点 + `onExit()` 打印（要分位数时） |
+| 改 | `core/CXLTable.h` | 顶部 | `#include` Time.h / Percentile.h / `<mutex>` |
+| 改 | `core/CXLTable.h` | `namespace star` 内 | `extern` 4 个 `Percentile<uint64_t>` + 1 个 `std::mutex` |
+| 改 | `core/CXLTable.h` | `:132/147/164/179` | 4 方法 `star::Time` 计时 + 锁内 `Percentile::add`（search 单出口） |
+| 改 | `core/Table.cpp` | 末尾 | 定义 4 个 Percentile + mutex |
+| 改 | `core/Coordinator.h` | `:371` 后 | 锁内 `LOG` 打印各 Percentile 的 `avg/nth` |
+| 改（可选） | `core/Executor.h` + `TwoPLPashaExecutor.h` | `:389` / `:136,358` | 无锁变体：per-worker Percentile 成员 + 调用点打点 + `onExit()` 打印 |
 
-> **无新增文件、无新增类/结构体/枚举、无编译开关宏**；计时统一用 `star::Time`，打点始终生效。
+> **无新增文件、无新增类/结构体/枚举、无编译宏**；计时用 `star::Time`，**所有时延变量统一用 `star::Percentile` 收集**。
 
 ---
 
