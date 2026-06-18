@@ -18,6 +18,7 @@
    - **路线二（按需共享，方案 D）**：若确实想让统计**驻留 CXL、跨进程共享**（例如 host0 不收消息就能读到全 pod 合并分布），则必须**抛弃 `std::vector`，用 `boost::interprocess::offset_ptr` + CXL 固定容量数组 + 原子计数**自己重建一个位置无关的 `CXLPercentile`——这正是 `MPSCRingBuffer::entries_buffer`（`offset_ptr<char>`）的同款手法。
 3. 同进程内的「自旋时延、单次 enqueue/dequeue 耗时」是**时长（duration）**，无论本地还是共享方案，其数值跨进程都可比（见 §3 时钟说明）。
 4. 若想测**跨节点端到端传输时延**（入队→出队的绝对时间差），需在 **Entry 内嵌 `uint64_t` 时间戳**（位置无关）+ **跨进程同步时钟**（`Time::now()` 的 steady_clock 跨进程不可减，是真正难点，见 §6）。
+5. **把它们改成 `static` 可以解决崩溃**——因为 `static` 类成员不在对象/CXL 里、而在进程本地静态区；但 `static` 解决不了线程安全（要配 `thread_local`）、也换不来跨进程共享。推荐 **`static thread_local`**（等价方案 A），详见 §8。
 
 ---
 
@@ -344,7 +345,68 @@ class MPSCRingBuffer {
 
 ---
 
-## 8. 反模式（明确不要这样做）
+## 8. 能不能直接把这几个变量改成 `static`？（结论：能解决崩溃，但要看清原因与代价）
+
+这是一个很自然的想法，答案是 **能解决崩溃，但要理解它"为什么能"以及它"换不来什么"**。
+
+### 8.1 关键认知：`static` 类成员根本不在对象里、不在 CXL 里
+
+C++ 的 `static` 数据成员**不属于对象的内存布局**：
+- 它不计入 `sizeof(MPSCRingBuffer)`，**不会随 `placement-new` 进入 CXL**；
+- 它是**每进程一份**、位于该进程**静态存储区（本地 DRAM）**的全局变量，只是名字写在类作用域里而已。
+
+所以 `static Percentile<uint64_t> send_lat;` 天然就在**本地 DRAM**：内部 `std::vector` 从本进程堆分配、裸指针只在本进程内解引用 → **跨进程地址不一致 / offset_ptr 的问题根本不会发生** ✓。本质上，`static` 把变量从「CXL 对象内」挪到了「进程本地静态区」——和方案 A 殊途同归。
+
+> ⚠️ **最容易误解的点**：`static` 类成员 **≠ 共享内存**。它是「每进程各一份的全局」，不是「多进程共享的同一份」。想让多进程看到同一份统计，只有放 CXL（方案 D 的 `offset_ptr`）。**如果你以为 `static` 能让各节点共享统计，那是错的。**
+
+### 8.2 直接用 `static` 的三个后果
+
+| 后果 | 说明 |
+|---|---|
+| ① **不跨进程共享** | 每个进程一份副本。要 host0 看到全 pod 合并分布，仍需方案 D（offset_ptr 入 CXL）或事后用 `STATISTICS` 消息聚合（见 `figures_latency_throughput_prints.md` §6）。 |
+| ② **进程内所有 ringbuffer 共用一份** | `static` 是 per-class-per-process，本进程 `coordinator_num` 个 ringbuffer 全写同一个 `send_lat` → 丢失「按目标节点区分」的粒度，变成本进程总体 transport 时延。 |
+| ③ **仍然不是线程安全的** | `static` 不解决并发！多个生产者线程并发 `add` 同一个 static `Percentile` → `std::vector::push_back` 数据竞争。反而比 thread_local 更糟（全进程线程抢一个）。**必须再加锁。** |
+
+此外：非 inline 的 static 数据成员需要**类外定义**（或 C++17 `inline static`），否则链接报错。
+
+### 8.3 推荐写法：`static thread_local`（一举解决崩溃 + 线程安全）
+
+把它们声明为 **`static thread_local`**，同时拿下「不在 CXL」和「无数据竞争」，且语法上仍写在 `class MPSCRingBuffer` 内、满足"作为成员"的诉求：
+
+```cpp
+class MPSCRingBuffer {
+    ...
+    static thread_local Percentile<uint64_t> ring_spin_wait;
+    static thread_local Percentile<uint64_t> send_lat;
+    static thread_local Percentile<uint64_t> recv_lat;
+};
+// 类外定义（每线程各一份，位于线程本地存储）
+thread_local Percentile<uint64_t> MPSCRingBuffer::ring_spin_wait;
+thread_local Percentile<uint64_t> MPSCRingBuffer::send_lat;
+thread_local Percentile<uint64_t> MPSCRingBuffer::recv_lat;
+```
+
+- `static thread_local` = **每线程一份、位于线程本地存储（本地 DRAM）**——这正是代码库 `CXL_EBR` 用的同款模式（`common/CXL_EBR.h:194` 的 `static thread_local EBRMetaLocal`）。
+- 优点：① 不在 CXL，无跨进程指针问题；② 每线程独立，`add` 无需锁、无竞争；③ 仍写在类里，满足"成员"诉求。
+- 仍是 per-process（不跨进程聚合）、且同一线程内所有 ringbuffer 合并。若要**按 ringbuffer 区分**，改成 `static thread_local std::unordered_map<uint64_t, Stats>` 用 ringbuffer id 索引。
+- 埋点代码同 §4.2，直接 `send_lat.add(us)` 即写当前线程的实例；打印在各线程退出处（仿 `CXL_EBR::print_statistics`）。
+
+### 8.4 四种"放哪"对比
+
+| 写法 | 在 CXL? | 跨进程共享? | 线程安全? | 区分 ringbuffer? | 评价 |
+|---|---|---|---|---|---|
+| 普通成员 `Percentile x;` | 是（随对象进 CXL） | — | — | 是（每对象） | ❌ 崩溃（std::vector 裸指针） |
+| `static Percentile x;` | 否（进程静态区/本地 DRAM） | 否 | ❌ 需自己加锁 | 否（进程内全合并） | ⚠️ 能跑，但要加锁、粒度粗 |
+| **`static thread_local Percentile x;`** | 否（线程本地/本地 DRAM） | 否 | ✅ | 否（线程内合并） | ✅ **推荐（= 方案 A）** |
+| `CXLPercentile`（offset_ptr，§7） | 是 | ✅ | 需原子/锁 | 看设计 | 仅当**确需跨进程共享**时（方案 D） |
+
+### 8.5 一句话总结
+
+**`static` 能解决崩溃——因为它把变量从 CXL 对象里挪到了进程本地静态区，根本不参与跨进程映射；但它解决不了线程安全（要配 `thread_local`），也换不来"跨进程共享"（那只能靠方案 D 的 `offset_ptr` 入 CXL）。** 因此推荐 **`static thread_local`**（等价方案 A）；只有当你明确需要"多节点共享同一份统计、host0 免消息直读"时，才用方案 D。
+
+---
+
+## 9. 反模式（明确不要这样做）
 
 1. ❌ `Percentile<uint64_t> send_lat;` 作为 `MPSCRingBuffer` 成员——含 `std::vector`，跨进程必崩（§2）。
 2. ❌ 直接用 `offset_ptr` 包**现成的 `Percentile`/`std::vector`**——offset_ptr 只解决「指向 CXL 内部」的偏移；`std::vector` 的存储在进程私有堆、内部又是裸指针，套一层 offset_ptr 也没用。**正确的 offset_ptr 用法是把 `std::vector` 整体换成「`offset_ptr<T>` + CXL 固定数组 + 原子游标」自己重建（见 §7），而不是去包 `std::vector`。**
@@ -354,7 +416,7 @@ class MPSCRingBuffer {
 
 ---
 
-## 9. 推荐落地步骤
+## 10. 推荐落地步骤
 
 1. 新增 `common/MPSCRingBufferStats.h`：`MPSCRingBufferStats` 结构 + `get_local_ringbuffer_stats()`（`static thread_local`）。
 2. 在 `MPSCRingBuffer::send/recv/dequeue` 用本进程 `steady_clock` 埋点，写入 `get_local_ringbuffer_stats()`（§4.2）。**不给 `MPSCRingBuffer` 增加任何成员**，CXL 布局零变化。
@@ -365,7 +427,7 @@ class MPSCRingBuffer {
 
 ---
 
-## 10. 一图总结
+## 11. 一图总结
 
 ```
             CXL 共享内存（多进程不同虚拟基址，靠 offset 一致）
