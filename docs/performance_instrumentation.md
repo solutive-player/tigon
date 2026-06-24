@@ -189,23 +189,23 @@ for (auto i = 0u; i < 0.99 * data_.size(); i += step_size) cdf_result.push_back(
 
 ```mermaid
 flowchart TB
-    subgraph RUN["稳态运行期 (每事务/每消息)"]
+    subgraph RUN["稳态运行期 每事务或每消息"]
         A["代码路径产生一个延迟值 value"]
-        B{"warmed_up?<br/>且 uniform(0,100) ≤ 10 ?"}
+        B{"warmed_up 且 uniform 0-100 落在 0-10 ?"}
         A --> B
-        B -->|"否 (约 89.1%)"| DROP["丢弃, 不计入"]
-        B -->|"是 (约 10.9%)"| KEEP["data_.push_back(value)<br/>sum += value<br/>isSorted_ = false"]
+        B -->|"否 约 89.1%"| DROP["丢弃 不计入"]
+        B -->|"是 约 10.9%"| KEEP["data_.push_back value 与 sum += value<br/>同时 isSorted_ = false"]
     end
-    subgraph EXIT["线程退出 onExit / print_stats"]
-        S["checkSort(): std::sort 一次"]
-        N50["nth(50) = 升序第 ceil(0.5N) 个样本  中位数"]
-        N90["nth(90) = 升序第 ceil(0.9N) 个样本  p90"]
-        N99["nth(99) = 升序第 ceil(0.99N) 个样本  p99 尾延迟"]
-        AV["avg() = sum / (N+0.1)"]
+    subgraph EXIT["线程退出 onExit 或 print_stats"]
+        S["checkSort 触发 std::sort 一次"]
+        N50["nth 50 = 升序第 ceil 0.5N 个样本 即中位数"]
+        N90["nth 90 = 升序第 ceil 0.9N 个样本 即 p90"]
+        N99["nth 99 = 升序第 ceil 0.99N 个样本 即 p99 尾延迟"]
+        AV["avg = sum 除以 N 加 0.1 无需排序"]
         S --> N50 --> N90 --> N99
+        S --> AV
     end
     KEEP --> S
-    KEEP -.->|"sum 累加, 无需排序"| AV
 ```
 
 > **小结**：`Percentile` = "稳态门控 + ~10.9% 伯努利采样 + 全量留存 + 惰性排序 + nearest-rank 取分位"。
